@@ -1,0 +1,7 @@
+<resources>
+    <style name="Theme.Lllm" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/bg</item>
+    </style>
+    <color name="bg">#FF141413</color>
+    <color name="accent">#FFD97757</color>
+</resources>
