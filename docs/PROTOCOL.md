@@ -22,7 +22,7 @@ message that belongs to that request. Requests may be pipelined; replies can arr
 | `list_sessions`  |                                                           | `{sessions: [Summary]}`          |
 | `new_session`    | `title?`, `provider?`, `model?`, `system?`, `options?`    | `{session: Session}`             |
 | `get_session`    | `session`                                                 | `{session: Session}`             |
-| `update_session` | `session`, any of `title`, `provider`, `model`, `system`, `options` | `{session: Session}`   |
+| `update_session` | `session`, any of `title`, `provider`, `model`, `system`, `options`, `archived` | `{session: Session}` |
 | `delete_session` | `session`                                                 | `{deleted: id}`                  |
 | `chat`           | `session`, `text`                                         | streamed events (below)          |
 | `cancel`         | `target` (the `id` of a running `chat`)                   | `{cancelled: bool}`              |
@@ -45,7 +45,9 @@ or `start`, any number of `thinking`/`delta`, then exactly one `end`.
 
 ## Data
 
-**Summary**: `{id, title, created, updated, provider, model, message_count, preview, generating}`
+**Summary**: `{id, title, created, updated, provider, model, message_count, preview, generating, archived}`
+
+`updated` is the time of the last message; renaming or archiving does not change it.
 
 **Session**:
 ```json

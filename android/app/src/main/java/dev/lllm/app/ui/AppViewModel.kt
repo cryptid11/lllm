@@ -8,6 +8,7 @@ import dev.lllm.app.data.ProfileStore
 import dev.lllm.app.relay.ChatMessage
 import dev.lllm.app.relay.Hello
 import dev.lllm.app.relay.RelayClient
+import dev.lllm.app.relay.RelayException
 import dev.lllm.app.relay.SessionDetail
 import dev.lllm.app.relay.SessionSummary
 import dev.lllm.app.relay.strings
@@ -42,9 +43,15 @@ data class UiState(
     val generatingSince: Long? = null,
     val models: List<String>? = null,
     val notice: String? = null,
+    /** The session list shows archived sessions instead of active ones. */
+    val showArchived: Boolean = false,
+    /** Sessions swiped away whose delete can still be undone. */
+    val pendingDelete: Set<String> = emptySet(),
 ) {
     val connected get() = conn is Conn.Up
     val generating get() = generatingSince != null
+    val visibleSessions get() = sessions.filter { it.archived == showArchived && it.id !in pendingDelete }
+    val archivedCount get() = sessions.count { it.archived && it.id !in pendingDelete }
 }
 
 class AppViewModel(app: Application) : AndroidViewModel(app) {
@@ -57,6 +64,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private var connectJob: Job? = null
     private var pollJob: Job? = null
     private var chatId: Long? = null
+    private val deleteJobs = mutableMapOf<String, Job>()
 
     init {
         val profile = store.load()
@@ -84,7 +92,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         when (s.screen) {
             Screen.Chat -> goTo(Screen.Sessions)
             Screen.Setup -> if (s.profile?.isComplete == true) goTo(Screen.Sessions)
-            Screen.Sessions -> {}
+            Screen.Sessions -> if (s.showArchived) showArchived(false)
         }
     }
 
@@ -179,9 +187,52 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun deleteSession(id: String) = withClient { c ->
-        c.call("delete_session", mapOf("session" to id))
-        _state.update { st -> st.copy(sessions = st.sessions.filterNot { it.id == id }) }
+    fun showArchived(show: Boolean) = _state.update { it.copy(showArchived = show) }
+
+    fun renameSession(id: String, title: String) = withClient { c ->
+        val saved = SessionDetail.from(c.call("update_session", mapOf("session" to id, "title" to title))).title
+        _state.update { st ->
+            st.copy(
+                sessions = st.sessions.map { if (it.id == id) it.copy(title = saved) else it },
+                session = st.session?.let { if (it.id == id) it.copy(title = saved) else it },
+            )
+        }
+    }
+
+    fun setArchived(id: String, archived: Boolean) {
+        _state.update { st -> st.copy(sessions = st.sessions.map { if (it.id == id) it.copy(archived = archived) else it }) }
+        withClient { c ->
+            try {
+                c.call("update_session", mapOf("session" to id, "archived" to archived))
+            } catch (e: Exception) {
+                refreshSessions() // undo the optimistic change
+                throw e
+            }
+        }
+    }
+
+    /** Hides the session now and deletes it on the server unless [undoDelete] comes first. */
+    fun deleteSoon(id: String) {
+        _state.update { it.copy(pendingDelete = it.pendingDelete + id) }
+        deleteJobs[id] = viewModelScope.launch {
+            try {
+                delay(UNDO_MS)
+                val c = client ?: throw RelayException("Not connected, so the session was kept")
+                c.call("delete_session", mapOf("session" to id))
+                _state.update { st -> st.copy(sessions = st.sessions.filterNot { it.id == id }) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                notice(describe(e))
+            } finally {
+                deleteJobs.remove(id)
+                _state.update { it.copy(pendingDelete = it.pendingDelete - id) }
+            }
+        }
+    }
+
+    fun undoDelete(id: String) {
+        deleteJobs.remove(id)?.cancel()
     }
 
     private fun reloadSession(id: String) = withClient { c ->
@@ -323,6 +374,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     companion object {
+        /** How long a swiped-away session can be restored; a bit longer than the snackbar. */
+        const val UNDO_MS = 5_000L
+
         val COMMANDS = listOf(
             "/new" to "start a new session",
             "/model" to "pick a model (or /model NAME)",

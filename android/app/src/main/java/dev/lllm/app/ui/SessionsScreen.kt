@@ -20,6 +20,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
@@ -28,15 +29,28 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Snackbar
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
+import androidx.compose.material3.SwipeToDismissBox
+import androidx.compose.material3.SwipeToDismissBoxValue
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -44,22 +58,46 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.lllm.app.relay.SessionSummary
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SessionsScreen(state: UiState, vm: AppViewModel) {
-    var confirmDelete by remember { mutableStateOf<SessionSummary?>(null) }
+    var renaming by remember { mutableStateOf<SessionSummary?>(null) }
+    val snackbar = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
+    val archivedView = state.showArchived
+
+    /** Shows "<message> · Undo", replacing any snackbar already up so each undo window starts now. */
+    fun offerUndo(message: String, undo: () -> Unit) {
+        snackbar.currentSnackbarData?.dismiss()
+        scope.launch {
+            val result = snackbar.showSnackbar(message, actionLabel = "Undo", duration = SnackbarDuration.Short)
+            if (result == SnackbarResult.ActionPerformed) undo()
+        }
+    }
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = {
                     Column {
-                        Text("lllm", color = Palette.Accent)
+                        Text(if (archivedView) "Archived" else "lllm", color = Palette.Accent)
                         ConnLine(state)
                     }
                 },
+                navigationIcon = {
+                    if (archivedView) {
+                        IconButton(onClick = { vm.showArchived(false) }) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Active sessions")
+                        }
+                    }
+                },
                 actions = {
+                    if (!archivedView && state.archivedCount > 0) {
+                        TextButton(onClick = { vm.showArchived(true) }) { Text("Archived ${state.archivedCount}") }
+                    }
                     IconButton(onClick = { vm.refreshSessions() }, enabled = state.connected) {
                         Icon(Icons.Default.Refresh, contentDescription = "Refresh")
                     }
@@ -69,8 +107,13 @@ fun SessionsScreen(state: UiState, vm: AppViewModel) {
                 },
             )
         },
+        snackbarHost = {
+            SnackbarHost(snackbar) { data ->
+                Snackbar(data, containerColor = Palette.Raised, contentColor = Palette.Text, actionColor = Palette.Accent)
+            }
+        },
         floatingActionButton = {
-            if (state.connected) {
+            if (state.connected && !archivedView) {
                 ExtendedFloatingActionButton(
                     onClick = { vm.newSession() },
                     icon = { Icon(Icons.Default.Add, contentDescription = null) },
@@ -96,30 +139,61 @@ fun SessionsScreen(state: UiState, vm: AppViewModel) {
                     TextButton(onClick = { vm.connect() }) { Text("Retry") }
                 }
             }
-            if (state.connected && state.sessions.isEmpty()) {
+            val sessions = state.visibleSessions
+            if (state.connected && sessions.isEmpty()) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("No sessions yet", color = Palette.Dim)
+                    Text(if (archivedView) "Nothing archived" else "No sessions yet", color = Palette.Dim)
                 }
             }
             LazyColumn(contentPadding = PaddingValues(bottom = 96.dp)) {
-                items(state.sessions, key = { it.id }) { s ->
-                    SessionRow(s, onOpen = { vm.openSession(s.id) }, onLongPress = { confirmDelete = s })
+                items(sessions, key = { it.id }) { s ->
+                    val name = s.title.ifEmpty { "(untitled)" }
+                    SwipeableSessionRow(
+                        s,
+                        archivedView = archivedView,
+                        onOpen = { vm.openSession(s.id) },
+                        onLongPress = { renaming = s },
+                        onDelete = {
+                            vm.deleteSoon(s.id)
+                            offerUndo("Deleted “$name”") { vm.undoDelete(s.id) }
+                        },
+                        onToggleArchive = {
+                            val archive = !s.archived
+                            vm.setArchived(s.id, archive)
+                            offerUndo(if (archive) "Archived “$name”" else "Restored “$name”") {
+                                vm.setArchived(s.id, !archive)
+                            }
+                        },
+                    )
+                }
+                if (sessions.isNotEmpty()) {
+                    item(key = "hint") {
+                        Text(
+                            "hold to rename · swipe ← delete · swipe → ${if (archivedView) "unarchive" else "archive"}",
+                            Modifier.fillMaxWidth().padding(16.dp),
+                            color = Color(0xFF5E5C58), fontSize = 11.sp,
+                        )
+                    }
                 }
             }
         }
     }
 
-    confirmDelete?.let { s ->
+    renaming?.let { s ->
+        var title by remember(s.id) { mutableStateOf(s.title) }
         AlertDialog(
-            onDismissRequest = { confirmDelete = null },
-            title = { Text("Delete session?") },
-            text = { Text(s.title.ifEmpty { "(untitled)" }) },
-            confirmButton = {
-                TextButton(onClick = { vm.deleteSession(s.id); confirmDelete = null }) {
-                    Text("Delete", color = Palette.Error)
-                }
+            onDismissRequest = { renaming = null },
+            title = { Text("Rename session") },
+            text = {
+                OutlinedTextField(title, { title = it }, Modifier.fillMaxWidth(), label = { Text("Title") }, singleLine = true)
             },
-            dismissButton = { TextButton(onClick = { confirmDelete = null }) { Text("Cancel") } },
+            confirmButton = {
+                TextButton(
+                    onClick = { vm.renameSession(s.id, title); renaming = null },
+                    enabled = title.isNotBlank(),
+                ) { Text("Save") }
+            },
+            dismissButton = { TextButton(onClick = { renaming = null }) { Text("Cancel") } },
         )
     }
 }
@@ -139,13 +213,59 @@ fun ConnLine(state: UiState) {
     }
 }
 
+/** Swipe left (end to start) deletes; swipe right archives, or unarchives in the archived view. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SwipeableSessionRow(
+    s: SessionSummary,
+    archivedView: Boolean,
+    onOpen: () -> Unit,
+    onLongPress: () -> Unit,
+    onDelete: () -> Unit,
+    onToggleArchive: () -> Unit,
+) {
+    val swipe = rememberSwipeToDismissBoxState(positionalThreshold = { distance -> distance * 0.4f })
+    val delete by rememberUpdatedState(onDelete)
+    val toggleArchive by rememberUpdatedState(onToggleArchive)
+    LaunchedEffect(swipe) {
+        // The swipe position is saved per row key, so a row restored by Undo would come back
+        // already "dismissed". Reset it, and only act on swipes that happen from here on.
+        if (swipe.currentValue != SwipeToDismissBoxValue.Settled) swipe.snapTo(SwipeToDismissBoxValue.Settled)
+        snapshotFlow { swipe.currentValue }.drop(1).collect { value ->
+            when (value) {
+                SwipeToDismissBoxValue.EndToStart -> delete()
+                SwipeToDismissBoxValue.StartToEnd -> toggleArchive()
+                SwipeToDismissBoxValue.Settled -> {}
+            }
+        }
+    }
+
+    SwipeToDismissBox(
+        state = swipe,
+        backgroundContent = {
+            val (color, label, align) = when (swipe.dismissDirection) {
+                SwipeToDismissBoxValue.EndToStart -> Triple(Palette.Error, "Delete", Alignment.CenterEnd)
+                SwipeToDismissBoxValue.StartToEnd ->
+                    Triple(Palette.Accent, if (archivedView) "Unarchive" else "Archive", Alignment.CenterStart)
+                SwipeToDismissBoxValue.Settled -> Triple(Color.Transparent, "", Alignment.Center)
+            }
+            Box(Modifier.fillMaxSize().background(color).padding(horizontal = 24.dp), contentAlignment = align) {
+                Text(label, color = Palette.Bg, fontSize = 14.sp)
+            }
+        },
+    ) {
+        SessionRow(s, onOpen, onLongPress)
+    }
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun SessionRow(s: SessionSummary, onOpen: () -> Unit, onLongPress: () -> Unit) {
     Column(
         Modifier
             .fillMaxWidth()
-            .combinedClickable(onClick = onOpen, onLongClick = onLongPress)
+            .background(Palette.Bg) // opaque, so the swipe background only shows while swiping
+            .combinedClickable(onClick = onOpen, onLongClick = onLongPress, onLongClickLabel = "Rename")
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(3.dp),
     ) {

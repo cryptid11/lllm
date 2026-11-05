@@ -341,6 +341,7 @@ def summarize(session) -> dict:
         "message_count": len(msgs),
         "preview": (last["content"][:120] if last else ""),
         "generating": is_generating(session),
+        "archived": bool(session.get("archived")),
     }
 
 
@@ -381,8 +382,10 @@ class SessionStore:
                 if m.pop("partial", None):
                     m["status"] = "interrupted"
 
-    def save(self, session, durable=True):
-        session["updated"] = time.time()
+    def save(self, session, durable=True, touch=True):
+        """Write atomically. `touch` bumps `updated`, which orders the session list by activity."""
+        if touch:
+            session["updated"] = time.time()
         path = self._path(session["id"])
         fd, tmp = tempfile.mkstemp(dir=self.root, prefix=".tmp-", suffix=".json")
         try:
@@ -484,7 +487,7 @@ class Engine:
         return session
 
     def update_session(self, sid, **changes):
-        allowed = {"title", "provider", "model", "system", "options"}
+        allowed = {"title", "provider", "model", "system", "options", "archived"}
         with self.store.lock:
             session = self.store.load(sid)
             for key, value in changes.items():
@@ -492,8 +495,15 @@ class Engine:
                     raise RelayError(f"cannot change {key!r}")
                 if key == "provider":
                     self.provider(value)
+                if key == "title":
+                    if not isinstance(value, str):
+                        raise RelayError("title must be a string")
+                    value = " ".join(value.split())[:200]
+                if key == "archived" and not isinstance(value, bool):
+                    raise RelayError("archived must be true or false")
                 session[key] = value
-            self.store.save(session)
+            # Renaming or archiving is not activity: keep the session's place in the list.
+            self.store.save(session, touch=False)
         return session
 
     def _history(self, session, upto):
@@ -822,7 +832,8 @@ def cmd_sessions(args):
     engine = Engine(load_config())
     for s in engine.store.list():
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(s["updated"] or 0))
-        print(f"{s['id']}  {when}  {s['message_count']:>3} msgs  {s['model']}  {s['title'] or '(untitled)'}")
+        flag = "  [archived]" if s["archived"] else ""
+        print(f"{s['id']}  {when}  {s['message_count']:>3} msgs  {s['model']}  {s['title'] or '(untitled)'}{flag}")
     return 0
 
 

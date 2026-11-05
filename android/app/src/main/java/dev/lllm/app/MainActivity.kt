@@ -55,7 +55,11 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun App(vm: AppViewModel) {
     val state by vm.state.collectAsStateWithLifecycle()
-    BackHandler(enabled = state.screen == Screen.Chat || (state.screen == Screen.Setup && state.profile?.isComplete == true)) {
+    BackHandler(
+        enabled = state.screen == Screen.Chat ||
+            (state.screen == Screen.Sessions && state.showArchived) ||
+            (state.screen == Screen.Setup && state.profile?.isComplete == true)
+    ) {
         vm.back()
     }
     Box(Modifier.fillMaxSize().background(Palette.Bg)) {

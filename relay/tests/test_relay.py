@@ -223,6 +223,19 @@ class RelayTest(unittest.TestCase):
         finally:
             client.close()
 
+    def test_rename_and_archive(self):
+        a, b = self.new_session(), self.new_session()  # b is newer, so listed first
+        before = [s["id"] for s in self.client.call("list_sessions")["data"]["sessions"]]
+        self.assertEqual(before, [b["id"], a["id"]])
+        renamed = self.client.call("update_session", session=a["id"], title="  My   chat ")["data"]["session"]
+        self.assertEqual(renamed["title"], "My chat")
+        self.client.call("update_session", session=a["id"], archived=True)
+        listed = self.client.call("list_sessions")["data"]["sessions"]
+        self.assertEqual([s["id"] for s in listed], before)  # metadata edits keep the order
+        self.assertEqual([s["archived"] for s in listed], [False, True])
+        self.assertEqual(self.client.call("update_session", session=a["id"], archived="yes")["type"], "error")
+        self.assertEqual(self.client.call("update_session", session=a["id"], title=5)["type"], "error")
+
     def test_bad_requests(self):
         self.assertEqual(self.client.call("nope")["type"], "error")
         self.assertIn("invalid session id", self.client.call("get_session", session="../etc")["error"])

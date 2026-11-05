@@ -4,6 +4,7 @@ import dev.lllm.app.data.SshKeys
 import dev.lllm.app.relay.ChatMessage
 import dev.lllm.app.relay.SessionDetail
 import dev.lllm.app.relay.SessionSummary
+import dev.lllm.app.ui.UiState
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -49,5 +50,16 @@ class CoreTest {
         val list = SessionSummary.listFrom(data)
         assertEquals("", list[0].title)
         assertTrue(list[0].generating)
+        assertEquals(false, list[0].archived)
+    }
+
+    @Test
+    fun sessionListHidesArchivedAndPendingDeletes() {
+        fun s(id: String, archived: Boolean = false) = SessionSummary(id, id, 0.0, "p", "m", 0, "", false, archived)
+        val state = UiState(sessions = listOf(s("a"), s("b"), s("c", archived = true), s("d", archived = true)),
+                            pendingDelete = setOf("b", "d"))
+        assertEquals(listOf("a"), state.visibleSessions.map { it.id })
+        assertEquals(1, state.archivedCount)
+        assertEquals(listOf("c"), state.copy(showArchived = true).visibleSessions.map { it.id })
     }
 }

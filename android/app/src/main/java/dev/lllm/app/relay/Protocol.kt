@@ -32,6 +32,7 @@ data class SessionSummary(
     val messageCount: Int,
     val preview: String,
     val generating: Boolean,
+    val archived: Boolean = false,
 ) {
     companion object {
         fun from(o: JSONObject) = SessionSummary(
@@ -43,6 +44,7 @@ data class SessionSummary(
             messageCount = o.optInt("message_count"),
             preview = o.str("preview") ?: "",
             generating = o.optBoolean("generating"),
+            archived = o.optBoolean("archived"),
         )
 
         fun listFrom(data: JSONObject): List<SessionSummary> =
