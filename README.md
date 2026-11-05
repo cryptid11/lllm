@@ -39,8 +39,11 @@ just point `base_url` at it.
     "ollama":   {"type": "ollama", "base_url": "http://127.0.0.1:11434", "default_model": "qwen3.5:2b",
                  "options": {"num_ctx": 8192}, "keep_alive": "30m"},
     "llamacpp": {"type": "openai", "base_url": "http://127.0.0.1:8080/v1"},
-    "remote":   {"type": "openai", "base_url": "https://openrouter.ai/api/v1",
-                 "api_key_env": "OPENROUTER_API_KEY", "default_model": "qwen/qwen3-32b"}
+    "openrouter": {"type": "openai", "base_url": "https://openrouter.ai/api/v1",
+                   "api_key_file": "~/openrouter.key",
+                   "models": ["moonshotai/kimi-k3.1-pro", "qwen/qwen3.8-max-prime"],
+                   "default_model": "moonshotai/kimi-k3.1-pro",
+                   "params": {"max_tokens": 1024}}
   },
   "system_prompt": "You are a helpful assistant.",
   "sessions_dir": "~/.local/share/lllm/sessions"
@@ -48,6 +51,14 @@ just point `base_url` at it.
 ```
 
 An empty `default_model` means "the first model the backend reports".
+
+- `models` limits the app's model picker to that list (otherwise it shows everything the backend lists).
+- The key comes from `api_key` (inline), `api_key_file` (read on each request, so you can rotate it
+  without restarting), or `api_key_env` (an environment variable).
+- `params` go into every request (`max_tokens`, `temperature`, ...). With OpenRouter, set
+  `max_tokens`: without it, OpenRouter reserves the model's whole output budget up front and refuses
+  requests from keys with a low spending limit.
+- `headers` adds extra HTTP headers.
 
 ## 2. Phone
 

@@ -189,6 +189,8 @@ class OllamaProvider:
         self.base = cfg.get("base_url", "http://127.0.0.1:11434").rstrip("/")
 
     def list_models(self):
+        if self.cfg.get("models"):
+            return list(self.cfg["models"])
         data = http_json("GET", f"{self.base}/api/tags", timeout=15)
         return [m["name"] for m in data.get("models", [])]
 
@@ -236,11 +238,27 @@ class OpenAIProvider:
         self.timeout = timeout
         self.base = cfg.get("base_url", "http://127.0.0.1:8080/v1").rstrip("/")
 
+    def _api_key(self):
+        if self.cfg.get("api_key"):
+            return self.cfg["api_key"]
+        if self.cfg.get("api_key_file"):
+            path = Path(self.cfg["api_key_file"]).expanduser()
+            try:
+                return path.read_text(encoding="utf-8").strip()
+            except OSError as e:
+                raise BackendError(f"provider {self.name!r}: cannot read api_key_file {path}: {e.strerror}") from None
+        return os.environ.get(self.cfg.get("api_key_env", ""), "")
+
     def _headers(self):
-        key = self.cfg.get("api_key") or os.environ.get(self.cfg.get("api_key_env", ""), "")
-        return {"Authorization": f"Bearer {key}"} if key else {}
+        key = self._api_key()
+        headers = dict(self.cfg.get("headers", {}))
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        return headers
 
     def list_models(self):
+        if self.cfg.get("models"):
+            return list(self.cfg["models"])
         data = http_json("GET", f"{self.base}/models", headers=self._headers(), timeout=15)
         return [m["id"] for m in data.get("data", [])]
 
@@ -253,6 +271,7 @@ class OpenAIProvider:
         conn, resp = http_request("POST", f"{self.base}/chat/completions", payload,
                                   headers=self._headers(), timeout=self.timeout, token=token)
         stats = {}
+        first = last = None
         try:
             for line in iter_lines(resp, token):
                 if not line.startswith("data:"):
@@ -270,6 +289,9 @@ class OpenAIProvider:
                 for choice in obj.get("choices") or []:
                     delta = choice.get("delta") or {}
                     reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                    if reasoning or delta.get("content"):
+                        last = time.monotonic()
+                        first = first or last
                     if reasoning:
                         yield "thinking", reasoning
                     if delta.get("content"):
@@ -278,6 +300,8 @@ class OpenAIProvider:
                         stats["done_reason"] = choice["finish_reason"]
         finally:
             conn.close()
+        if stats.get("eval_count") and first and last and last > first:
+            stats["tokens_per_sec"] = round(stats["eval_count"] / (last - first), 2)
         yield "stats", stats
 
 
@@ -512,8 +536,11 @@ class Engine:
         content, thinking, stats = [], [], {}
         status, error = "done", None
         started = last_save = time.monotonic()
+        first_token = None
         try:
             for kind, value in provider.stream_chat(model, history, session.get("options") or {}, token):
+                if first_token is None and kind in ("content", "thinking"):
+                    first_token = time.monotonic()
                 if kind == "content":
                     content.append(value)
                     emit({"type": "delta", "text": value})
@@ -536,6 +563,8 @@ class Engine:
             status, error = "error", f"{type(e).__name__}: {e}"
 
         stats["wall_sec"] = round(time.monotonic() - started, 2)
+        if first_token is not None:
+            stats["ttft_sec"] = round(first_token - started, 2)
         message = self._store_reply(sid, index, "".join(content), "".join(thinking),
                                     final=True, status=status, error=error, stats=stats)
         emit({"type": "end", "status": status, "error": error, "index": index, "message": message})

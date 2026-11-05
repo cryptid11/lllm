@@ -18,6 +18,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Refresh
@@ -91,7 +92,7 @@ fun SessionsScreen(state: UiState, vm: AppViewModel) {
                         .padding(12.dp)
                 ) {
                     Text("Not connected", color = Palette.Error)
-                    Text(conn.reason, color = Palette.Dim, fontSize = 13.sp)
+                    SelectionContainer { Text(conn.reason, color = Palette.Dim, fontSize = 13.sp) }
                     TextButton(onClick = { vm.connect() }) { Text("Retry") }
                 }
             }

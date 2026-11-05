@@ -6,3 +6,6 @@ android/app/build/
 android/local.properties
 android/.idea/
 *.iml
+
+# secrets
+*.key

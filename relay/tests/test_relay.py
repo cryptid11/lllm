@@ -192,6 +192,37 @@ class RelayTest(unittest.TestCase):
         dropped.proc.stdout.close()
         self.client = Client(self.env)  # for tearDown
 
+    def test_openai_provider_with_key_file(self):
+        key_file = Path(self.tmp.name) / "api.key"
+        key_file.write_text("test-key\n")
+        cfg = json.loads(Path(self.env["LLLM_CONFIG"]).read_text())
+        cfg["providers"]["remote"] = {"type": "openai", "base_url": f"http://127.0.0.1:{self.port}/v1",
+                                      "api_key_file": str(key_file)}
+        cfg["providers"]["curated"] = {**cfg["providers"]["remote"], "models": ["pick/one", "pick/two"]}
+        Path(self.env["LLLM_CONFIG"]).write_text(json.dumps(cfg))
+        client = Client(self.env)
+        try:
+            self.assertEqual(client.call("list_models", provider="remote")["data"]["models"],
+                             ["vendor/model-a", "vendor/model-b"])
+            self.assertEqual(client.call("list_models", provider="curated")["data"]["models"],
+                             ["pick/one", "pick/two"])
+            s = client.call("new_session", provider="remote")["data"]["session"]
+            self.assertEqual(s["model"], "vendor/model-a")
+            events = client.events_until_end(client.send("chat", session=s["id"], text="hi"))
+            self.assertEqual("".join(e["text"] for e in events if e["type"] == "thinking"), "pondering. ")
+            self.assertEqual("".join(e["text"] for e in events if e["type"] == "delta").strip(), "openai-echo: hi")
+            stats = events[-1]["message"]["stats"]
+            self.assertEqual(stats["eval_count"], 4)
+            self.assertGreater(stats["tokens_per_sec"], 0)
+            self.assertIn("ttft_sec", stats)
+
+            key_file.write_text("wrong-key")  # read per request, so rotating the key needs no restart
+            end = client.events_until_end(client.send("chat", session=s["id"], text="hi"))[-1]
+            self.assertEqual(end["status"], "error")
+            self.assertIn("invalid api key", end["error"])
+        finally:
+            client.close()
+
     def test_bad_requests(self):
         self.assertEqual(self.client.call("nope")["type"], "error")
         self.assertIn("invalid session id", self.client.call("get_session", session="../etc")["error"])

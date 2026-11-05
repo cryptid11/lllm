@@ -4,6 +4,8 @@ import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -41,9 +43,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
@@ -72,7 +72,6 @@ fun SetupScreen(state: UiState, vm: AppViewModel) {
 
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
-    val clipboard = LocalClipboardManager.current
 
     fun useKey(pem: String, pass: String) {
         scope.launch {
@@ -171,20 +170,27 @@ fun SetupScreen(state: UiState, vm: AppViewModel) {
             if (publicKey.isNotBlank()) {
                 val line = if (restrict) "command=\"${serveCommand(command)}\",restrict $publicKey" else publicKey
                 Text("Add this line to ~/.ssh/authorized_keys on the server:", color = Palette.Dim, fontSize = 13.sp)
-                Text(
-                    line,
-                    Modifier
-                        .fillMaxWidth()
-                        .background(Palette.Surface, RoundedCornerShape(6.dp))
-                        .padding(10.dp),
-                    color = Palette.Code, fontSize = 12.sp,
-                )
+                // Tap to copy, or long-press to select part of it.
+                SelectionContainer {
+                    Text(
+                        line,
+                        Modifier
+                            .fillMaxWidth()
+                            .background(Palette.Surface, RoundedCornerShape(6.dp))
+                            .clickable { copyText(context, "authorized_keys line", line) }
+                            .padding(10.dp),
+                        color = Palette.Code, fontSize = 12.sp,
+                    )
+                }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Switch(restrict, { restrict = it })
                     Spacer(Modifier.width(8.dp))
                     Text("Only allow this key to run the relay", Modifier.weight(1f), fontSize = 13.sp)
                 }
-                OutlinedButton(onClick = { clipboard.setText(AnnotatedString(line)) }) { Text("Copy line") }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = { copyText(context, "authorized_keys line", line) }) { Text("Copy line") }
+                    OutlinedButton(onClick = { shareText(context, line) }) { Text("Share") }
+                }
             }
 
             if (hostKey.isNotBlank()) {

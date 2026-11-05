@@ -4,6 +4,7 @@
 Streams back "echo: <last user message>" word by word using chunked NDJSON, like Ollama.
 Messages containing "slow" stream slowly (for cancel tests); "boom" returns a backend error;
 "markdown" replies with a sample of headings/lists/code; "think" streams reasoning first.
+Also serves an OpenAI-compatible API under /v1 that requires "Authorization: Bearer test-key".
 
     python3 mock_ollama.py [port] [seconds-per-word]
 """
@@ -44,7 +45,39 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
         self.wfile.flush()
 
+    def _authorized(self):
+        if self.headers.get("Authorization") == "Bearer test-key":
+            return True
+        self._json(401, {"error": {"message": "invalid api key"}})
+        return False
+
+    def _sse(self, obj):
+        data = f"data: {json.dumps(obj)}\n\n".encode()
+        self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+        self.wfile.flush()
+
+    def _openai_chat(self, req):
+        last = req["messages"][-1]["content"]
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        self.wfile.write(b"e\r\n: PROCESSING\n\n\r\n")  # SSE comment, as OpenRouter sends
+        self._sse({"choices": [{"delta": {"reasoning": "pondering. "}}]})
+        time.sleep(0.05)
+        for word in f"openai-echo: {last}".split(" "):
+            self._sse({"choices": [{"delta": {"content": word + " "}}]})
+            time.sleep(0.02)
+        self._sse({"choices": [{"delta": {}, "finish_reason": "stop"}],
+                   "usage": {"prompt_tokens": 9, "completion_tokens": 4}})
+        data = b"data: [DONE]\n\n"
+        self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n0\r\n\r\n")
+
     def do_GET(self):
+        if self.path == "/v1/models":
+            if self._authorized():
+                self._json(200, {"data": [{"id": "vendor/model-a"}, {"id": "vendor/model-b"}]})
+            return
         if self.path == "/api/tags":
             self._json(200, {"models": [{"name": "qwen-mock:latest"}, {"name": "other:1b"}]})
         else:
@@ -52,6 +85,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.path == "/v1/chat/completions":
+            if self._authorized():
+                self._openai_chat(req)
+            return
         if self.path != "/api/chat":
             return self._json(404, {"error": "not found"})
         if req["model"] not in ("qwen-mock:latest", "other:1b"):
