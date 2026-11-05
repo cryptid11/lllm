@@ -72,6 +72,10 @@ In a chat: type `/` for commands (`/new`, `/model`, `/sessions`, `/settings`, `/
 tap the model name to switch models, and tap ✕ to interrupt a reply. If the connection drops
 mid-reply, the server finishes and saves it, and the app picks it up when it reconnects.
 
+The connection stays open in the background (also after swiping the app away from Recents),
+shown by an ongoing "Connected" notification with a **Disconnect** button. Dropped connections
+reconnect on their own, and the phone is kept awake only while a reply is streaming.
+
 ## Testing without a model
 
 ```bash

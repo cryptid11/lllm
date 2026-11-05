@@ -1,13 +1,16 @@
 package dev.lllm.app
 
 import android.os.Bundle
+import android.Manifest
+import android.content.pm.PackageManager
 import android.graphics.Color
+import android.os.Build
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.activity.viewModels
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
@@ -25,7 +28,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import dev.lllm.app.ui.AppViewModel
+import dev.lllm.app.ui.AppController
 import dev.lllm.app.ui.ChatScreen
 import dev.lllm.app.ui.LllmTheme
 import dev.lllm.app.ui.Palette
@@ -35,7 +38,9 @@ import dev.lllm.app.ui.SetupScreen
 import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
-    private val vm: AppViewModel by viewModels()
+    private val vm: AppController get() = (application as LllmApp).controller
+
+    private val askNotifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -44,6 +49,13 @@ class MainActivity : ComponentActivity() {
             navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
         )
         setContent { LllmTheme { App(vm) } }
+        // The "connected" notification of the background service needs this on Android 13+.
+        // If refused, the service still runs; Android just hides its notification.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            askNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
     }
 
     override fun onResume() {
@@ -53,7 +65,7 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun App(vm: AppViewModel) {
+private fun App(vm: AppController) {
     val state by vm.state.collectAsStateWithLifecycle()
     BackHandler(
         enabled = state.screen == Screen.Chat ||

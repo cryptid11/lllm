@@ -63,7 +63,7 @@ import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SessionsScreen(state: UiState, vm: AppViewModel) {
+fun SessionsScreen(state: UiState, vm: AppController) {
     var renaming by remember { mutableStateOf<SessionSummary?>(null) }
     val snackbar = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
@@ -136,7 +136,8 @@ fun SessionsScreen(state: UiState, vm: AppViewModel) {
                 ) {
                     Text("Not connected", color = Palette.Error)
                     SelectionContainer { Text(conn.reason, color = Palette.Dim, fontSize = 13.sp) }
-                    TextButton(onClick = { vm.connect() }) { Text("Retry") }
+                    if (conn.retrying) Text("Retrying automatically…", color = Palette.Accent, fontSize = 12.sp)
+                    TextButton(onClick = { vm.connect() }) { Text(if (conn.retrying) "Retry now" else "Retry") }
                 }
             }
             val sessions = state.visibleSessions
@@ -203,7 +204,7 @@ fun ConnLine(state: UiState) {
     val (dot, text) = when (val c = state.conn) {
         is Conn.Up -> Palette.Ok to "${state.profile?.label} · ${c.hello.host}"
         Conn.Connecting -> Palette.Accent to "connecting to ${state.profile?.label}…"
-        is Conn.Down -> Palette.Error to "disconnected"
+        is Conn.Down -> if (c.retrying) Palette.Accent to "reconnecting…" else Palette.Error to "disconnected"
         Conn.Idle -> Palette.Dim to "not configured"
     }
     Row(verticalAlignment = Alignment.CenterVertically) {

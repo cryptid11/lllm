@@ -56,7 +56,7 @@ import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SetupScreen(state: UiState, vm: AppViewModel) {
+fun SetupScreen(state: UiState, vm: AppController) {
     val initial = state.profile ?: Profile()
     var host by rememberSaveable { mutableStateOf(initial.host) }
     var port by rememberSaveable { mutableStateOf(initial.port.toString()) }

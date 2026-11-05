@@ -59,7 +59,7 @@ import kotlinx.coroutines.delay
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ChatScreen(state: UiState, vm: AppViewModel) {
+fun ChatScreen(state: UiState, vm: AppController) {
     val session = state.session
     var input by rememberSaveable { mutableStateOf("") }
     val listState = rememberLazyListState()
@@ -285,7 +285,7 @@ private fun PromptBar(
     ) {
         // Slash-command suggestions, like Claude Code's command palette.
         if (input.startsWith("/") && !input.contains(' ')) {
-            val matches = AppViewModel.COMMANDS.filter { it.first.startsWith(input.lowercase()) }
+            val matches = AppController.COMMANDS.filter { it.first.startsWith(input.lowercase()) }
             Column(Modifier.padding(bottom = 6.dp)) {
                 matches.forEach { (cmd, help) ->
                     Row(

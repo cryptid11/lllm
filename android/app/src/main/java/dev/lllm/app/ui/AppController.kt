@@ -1,8 +1,7 @@
 package dev.lllm.app.ui
 
 import android.app.Application
-import androidx.lifecycle.AndroidViewModel
-import androidx.lifecycle.viewModelScope
+import dev.lllm.app.RelayService
 import dev.lllm.app.data.Profile
 import dev.lllm.app.data.ProfileStore
 import dev.lllm.app.relay.ChatMessage
@@ -13,8 +12,10 @@ import dev.lllm.app.relay.SessionDetail
 import dev.lllm.app.relay.SessionSummary
 import dev.lllm.app.relay.strings
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -29,7 +30,8 @@ sealed interface Conn {
     data object Idle : Conn
     data object Connecting : Conn
     data class Up(val hello: Hello) : Conn
-    data class Down(val reason: String) : Conn
+    /** [retrying]: a reconnect is scheduled. */
+    data class Down(val reason: String, val retrying: Boolean = false) : Conn
 }
 
 data class UiState(
@@ -54,8 +56,14 @@ data class UiState(
     val archivedCount get() = sessions.count { it.archived && it.id !in pendingDelete }
 }
 
-class AppViewModel(app: Application) : AndroidViewModel(app) {
+/**
+ * App state and the relay connection. It lives as long as the process (see [dev.lllm.app.LllmApp]),
+ * not the screen, so the connection survives the app going to the background; [RelayService]
+ * keeps the process alive meanwhile.
+ */
+class AppController(private val app: Application) {
 
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val store = ProfileStore(app)
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state.asStateFlow()
@@ -65,6 +73,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private var pollJob: Job? = null
     private var chatId: Long? = null
     private val deleteJobs = mutableMapOf<String, Job>()
+
+    /** The user wants to be connected: keep the service up and reconnect after drops. */
+    private var wantConnection = false
+    private var reconnectJob: Job? = null
+    private var reconnectAttempts = 0
 
     init {
         val profile = store.load()
@@ -112,13 +125,22 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         connect()
     }
 
+    /** Connects now, from the UI. Resets the reconnect backoff. */
     fun connect() {
+        reconnectAttempts = 0
+        open()
+    }
+
+    private fun open() {
         val profile = s.profile?.takeIf { it.isComplete } ?: return
+        wantConnection = true
+        RelayService.start(app)
+        reconnectJob?.cancel()
         connectJob?.cancel()
         client?.close()
         client = null
         _state.update { it.copy(conn = Conn.Connecting) }
-        connectJob = viewModelScope.launch {
+        connectJob = scope.launch {
             val c = RelayClient(profile)
             val hello = try {
                 withContext(Dispatchers.IO) { c.connect() }
@@ -126,9 +148,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 c.close()
                 throw e
             } catch (e: Exception) {
-                _state.update { it.copy(conn = Conn.Down(describe(e))) }
+                // RelayExceptions are our own diagnoses (key rejected, host key changed, relay
+                // missing): retrying will not fix them. Network errors usually go away.
+                val retry = e !is RelayException
+                _state.update { it.copy(conn = Conn.Down(describe(e), retrying = retry)) }
+                if (retry) scheduleReconnect()
                 return@launch
             }
+            reconnectAttempts = 0
             c.newHostKey?.let { fp ->
                 val pinned = profile.copy(hostKeyFingerprint = fp)
                 store.save(pinned)
@@ -141,12 +168,35 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 val reason = c.closed.await()
                 if (client === c) {
                     client = null
-                    _state.update { it.copy(conn = Conn.Down(reason), generatingSince = null) }
+                    _state.update { it.copy(conn = Conn.Down(reason, retrying = wantConnection), generatingSince = null) }
+                    if (wantConnection) scheduleReconnect()
                 }
             }
             refreshSessions()
             s.session?.let { reloadSession(it.id) }
         }
+    }
+
+    private fun scheduleReconnect() {
+        if (!wantConnection) return
+        val delayMs = minOf(60_000L, 2_000L shl minOf(reconnectAttempts, 5))
+        reconnectAttempts++
+        reconnectJob?.cancel()
+        reconnectJob = scope.launch {
+            delay(delayMs)
+            open()
+        }
+    }
+
+    /** Closes the connection and stops the background service until the next [connect]. */
+    fun disconnect() {
+        wantConnection = false
+        reconnectJob?.cancel()
+        connectJob?.cancel()
+        client?.close()
+        client = null
+        _state.update { it.copy(conn = Conn.Down("Disconnected"), generatingSince = null) }
+        RelayService.stop(app)
     }
 
     private fun describe(e: Exception): String = when {
@@ -157,7 +207,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** Runs [block] against the live connection, turning failures into a notice. */
-    private fun withClient(block: suspend (RelayClient) -> Unit) = viewModelScope.launch {
+    private fun withClient(block: suspend (RelayClient) -> Unit) = scope.launch {
         val c = client ?: return@launch notice("Not connected")
         try {
             block(c)
@@ -214,7 +264,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** Hides the session now and deletes it on the server unless [undoDelete] comes first. */
     fun deleteSoon(id: String) {
         _state.update { it.copy(pendingDelete = it.pendingDelete + id) }
-        deleteJobs[id] = viewModelScope.launch {
+        deleteJobs[id] = scope.launch {
             try {
                 delay(UNDO_MS)
                 val c = client ?: throw RelayException("Not connected, so the session was kept")
@@ -367,10 +417,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun stop() {
         val id = chatId ?: return
         withClient { it.cancel(id) }
-    }
-
-    override fun onCleared() {
-        client?.close()
     }
 
     companion object {
