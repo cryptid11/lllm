@@ -12,6 +12,7 @@ import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
+import dev.lllm.app.relay.PendingApproval
 import dev.lllm.app.ui.Conn
 import dev.lllm.app.ui.UiState
 import kotlinx.coroutines.CoroutineScope
@@ -32,7 +33,13 @@ class RelayService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var wakeLock: PowerManager.WakeLock? = null
 
-    private data class Status(val title: String, val text: String, val generating: Boolean)
+    /** [alert]: a tool call waits for approval while the app is not on screen. */
+    private data class Status(
+        val title: String,
+        val text: String,
+        val generating: Boolean,
+        val alert: PendingApproval? = null,
+    )
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -46,20 +53,35 @@ class RelayService : Service() {
                 setShowBadge(false)
             }
         )
+        nm.createNotificationChannel(
+            NotificationChannel(APPROVAL_CHANNEL, "Approvals", NotificationManager.IMPORTANCE_HIGH).apply {
+                description = "A tool call is waiting for you to allow or deny it"
+            }
+        )
         val controller = (application as LllmApp).controller
         goForeground(build(status(controller.state.value)))
         scope.launch {
             controller.state.map(::status).distinctUntilChanged().collect { st ->
                 nm.notify(NOTIFICATION_ID, build(st))
+                val alert = st.alert
+                if (alert != null) nm.notify(APPROVAL_ID, buildApproval(alert)) else nm.cancel(APPROVAL_ID)
                 holdAwake(st.generating)
             }
         }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val controller = (application as LllmApp).controller
         if (intent?.action == ACTION_DISCONNECT) {
-            (application as LllmApp).controller.disconnect() // stops this service
+            controller.disconnect() // stops this service
             return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_APPROVE) {
+            val pending = PendingApproval(
+                intent.getStringExtra(EXTRA_SESSION).orEmpty(), intent.getStringExtra(EXTRA_CALL).orEmpty(),
+                intent.getStringExtra(EXTRA_NAME).orEmpty(), "{}",
+            )
+            controller.approve(pending, intent.getStringExtra(EXTRA_DECISION) ?: "deny")
         }
         // If the system kills the process, recreate the service: the controller reconnects on start.
         return START_STICKY
@@ -85,8 +107,13 @@ class RelayService : Service() {
         return when (val c = st.conn) {
             is Conn.Up -> Status(
                 "Connected to $who",
-                if (st.generating) "Generating a reply…" else "Tap to open",
+                when {
+                    st.pendingApproval != null -> "Waiting for approval: ${st.pendingApproval.label}"
+                    st.generating -> "Generating a reply…"
+                    else -> "Tap to open"
+                },
                 st.generating,
+                alert = st.pendingApproval?.takeIf { !st.appVisible },
             )
             Conn.Connecting -> Status("Connecting to $who…", "", false)
             is Conn.Down -> Status(if (c.retrying) "Reconnecting to $who…" else "Disconnected", c.reason, false)
@@ -119,6 +146,32 @@ class RelayService : Service() {
             .build()
     }
 
+    private fun buildApproval(p: PendingApproval): Notification {
+        fun action(code: Int, decision: String) = PendingIntent.getService(
+            this, code,
+            Intent(this, RelayService::class.java).setAction(ACTION_APPROVE)
+                .putExtra(EXTRA_SESSION, p.session).putExtra(EXTRA_CALL, p.callId)
+                .putExtra(EXTRA_NAME, p.name).putExtra(EXTRA_DECISION, decision),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val open = PendingIntent.getActivity(
+            this, 2,
+            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        return NotificationCompat.Builder(this, APPROVAL_CHANNEL)
+            .setSmallIcon(R.drawable.ic_stat_relay)
+            .setContentTitle("Allow ${p.label}?")
+            .setContentText("The agent is waiting for you")
+            .setContentIntent(open)
+            .addAction(0, "Allow", action(10, "allow"))
+            .addAction(0, "Deny", action(11, "deny"))
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_REMINDER)
+            .build()
+    }
+
     /**
      * Keeps the CPU awake only while a reply streams, so it keeps arriving with the screen off.
      * An idle connection does not need it: the server keeps the session, and data wakes the device.
@@ -138,7 +191,14 @@ class RelayService : Service() {
     companion object {
         private const val CHANNEL = "connection"
         private const val NOTIFICATION_ID = 1
+        private const val APPROVAL_CHANNEL = "approvals"
+        private const val APPROVAL_ID = 2
         private const val ACTION_DISCONNECT = "dev.lllm.app.DISCONNECT"
+        private const val ACTION_APPROVE = "dev.lllm.app.APPROVE"
+        private const val EXTRA_SESSION = "session"
+        private const val EXTRA_CALL = "call_id"
+        private const val EXTRA_NAME = "name"
+        private const val EXTRA_DECISION = "decision"
 
         @Volatile
         private var running = false

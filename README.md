@@ -72,6 +72,23 @@ In a chat: type `/` for commands (`/new`, `/model`, `/sessions`, `/settings`, `/
 tap the model name to switch models, and tap ✕ to interrupt a reply. If the connection drops
 mid-reply, the server finishes and saves it, and the app picks it up when it reconnects.
 
+### Agent mode
+
+New sessions are agents: the model can run commands and read, write and edit files on the server,
+as the user the relay runs as (like Claude Code). Each call shows as `● Bash(…)` with its output.
+Calls that change things wait for **Allow / Always / Deny** (anything typed in the box goes to the
+model as the reason for a denial); with the app in the background you get a notification with
+Allow and Deny buttons.
+
+- `/mode` (or tap the mode in the footer) cycles `ask` → `auto-read` (default: reads are automatic)
+  → `auto` (nothing asks).
+- `/cd PATH` changes the working directory, `/agent off` makes a session chat-only.
+- In `config.json`, `"agent": {"enabled", "permission_mode", "workdir", "confine_to", "max_steps",
+  "approval_timeout"}` sets the defaults; `confine_to` keeps file tools inside one folder (bash is
+  not confined).
+
+Note that an agent can do anything the relay's user can, so the approvals are the safety net.
+
 The connection stays open in the background (also after swiping the app away from Recents),
 shown by an ongoing "Connected" notification with a **Disconnect** button. Dropped connections
 reconnect on their own, and the phone is kept awake only while a reply is streaming.

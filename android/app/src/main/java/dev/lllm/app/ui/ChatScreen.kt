@@ -20,6 +20,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -28,6 +30,8 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -51,10 +55,14 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.lllm.app.relay.ChatMessage
+import dev.lllm.app.relay.PendingApproval
+import dev.lllm.app.relay.ToolCall
+import org.json.JSONObject
 import kotlinx.coroutines.delay
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -70,7 +78,9 @@ fun ChatScreen(state: UiState, vm: AppController) {
         if (!listState.isScrollInProgress) follow = !listState.canScrollForward
     }
     val last = state.messages.lastOrNull()
-    LaunchedEffect(state.messages.size, last?.content?.length, last?.thinking?.length, state.generating) {
+    val liveChars = state.liveOutput.values.sumOf { it.length }
+    LaunchedEffect(state.messages.size, last?.content?.length, last?.thinking?.length, state.generating,
+                   liveChars, state.pendingApproval) {
         if (follow) {
             val count = listState.layoutInfo.totalItemsCount
             if (count > 0) listState.scrollToItem(count - 1)
@@ -97,7 +107,20 @@ fun ChatScreen(state: UiState, vm: AppController) {
             )
         },
         bottomBar = {
-            PromptBar(
+            val pending = state.pendingApproval
+            if (pending != null) {
+                ApprovalCard(
+                    pending,
+                    onAllow = { vm.approve("allow") },
+                    onAlways = { vm.approve("allow_session") },
+                    onDeny = { note ->
+                        vm.approve("deny", note)
+                        input = ""
+                    },
+                    note = input,
+                    onNote = { input = it },
+                )
+            } else PromptBar(
                 input = input,
                 onInput = { input = it },
                 state = state,
@@ -109,6 +132,7 @@ fun ChatScreen(state: UiState, vm: AppController) {
                 },
                 onStop = { vm.stop() },
                 onModel = { vm.loadModels() },
+                onMode = { vm.cycleMode() },
             )
         },
     ) { pad ->
@@ -125,9 +149,16 @@ fun ChatScreen(state: UiState, vm: AppController) {
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
             item(key = "welcome") { Welcome(state) }
+            // Tool results are shown under the call that produced them, not as messages of their own.
+            val results = state.messages.filter { it.isTool }.associateBy { it.toolCallId }
+            val replyIndex = state.messages.indexOfLast { it.role == "assistant" }
             itemsIndexed(state.messages) { i, m ->
-                val streaming = state.generating && i == state.messages.lastIndex
-                if (m.isUser) UserMessage(m) else AssistantMessage(m, streaming)
+                val streaming = state.generating && i == replyIndex
+                when {
+                    m.isUser -> UserMessage(m)
+                    m.isTool -> {}
+                    else -> AssistantMessage(m, streaming, results, state.liveOutput)
+                }
             }
             if (state.generating) item(key = "spinner") { Working(state.generatingSince ?: 0L) }
             item(key = "end") { Spacer(Modifier.size(4.dp)) }
@@ -174,6 +205,11 @@ private fun Welcome(state: UiState) {
         Text("✻ Welcome to lllm", color = Palette.Text)
         Text("  ${session.provider} · ${session.model}", color = Palette.Dim, fontSize = 12.sp)
         Text("  ${state.profile?.label}", color = Palette.Dim, fontSize = 12.sp)
+        if (session.agent) {
+            Text("  agent · ${session.permissionMode} · ${session.cwd}", color = Palette.Dim, fontSize = 12.sp)
+        } else {
+            Text("  chat only (/agent to give it tools)", color = Palette.Dim, fontSize = 12.sp)
+        }
         Text("  /help for commands", color = Palette.Dim, fontSize = 12.sp)
     }
 }
@@ -194,10 +230,15 @@ private fun UserMessage(m: ChatMessage) {
 }
 
 @Composable
-private fun AssistantMessage(m: ChatMessage, streaming: Boolean) {
+private fun AssistantMessage(
+    m: ChatMessage,
+    streaming: Boolean,
+    results: Map<String?, ChatMessage>,
+    live: Map<String, String>,
+) {
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         if (m.thinking.isNotBlank()) Thinking(m.thinking, startExpanded = streaming && m.content.isEmpty())
-        if (m.content.isNotEmpty() || !streaming) {
+        if (m.content.isNotEmpty() || (!streaming && m.toolCalls.isEmpty())) {
             Row {
                 Text("● ", color = if (streaming) Palette.Dim else Palette.Accent, fontSize = 14.sp)
                 SelectionContainer(Modifier.weight(1f)) {
@@ -205,6 +246,7 @@ private fun AssistantMessage(m: ChatMessage, streaming: Boolean) {
                 }
             }
         }
+        m.toolCalls.forEach { call -> ToolCallView(call, results[call.id], live[call.id]) }
         val note = when (m.status) {
             "cancelled" -> "Interrupted by user" to Palette.Error
             "interrupted" -> "Interrupted (relay stopped)" to Palette.Error
@@ -221,6 +263,115 @@ private fun AssistantMessage(m: ChatMessage, streaming: Boolean) {
             note != null -> Tail(note.first, note.second)
             stats.isNotEmpty() && !streaming -> Tail(stats, Palette.Dim)
         }
+    }
+}
+
+/** "● Bash(ls -la)" then "⎿ output", collapsed to a few lines until tapped. */
+@Composable
+private fun ToolCallView(call: ToolCall, result: ChatMessage?, live: String?) {
+    var expanded by remember { mutableStateOf(false) }
+    val (dot, dotColor) = when {
+        result == null -> "○" to Palette.Dim
+        result.ok == true -> "●" to Palette.Ok
+        else -> "●" to Palette.Error
+    }
+    val output = (result?.content ?: live).orEmpty().trimEnd()
+    val lines = output.lines()
+    val shown = if (expanded || lines.size <= 4) output else lines.take(4).joinToString("\n")
+    Column(Modifier.fillMaxWidth().clickable(enabled = output.isNotEmpty()) { expanded = !expanded }) {
+        Row {
+            Text("$dot ", color = dotColor, fontSize = 14.sp)
+            Text(call.label, color = Palette.Text, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+        }
+        val how = when (result?.approval) {
+            "allow", "allow_session" -> "approved"
+            "deny" -> "denied"
+            "timeout" -> "not approved in time"
+            "cancelled" -> "not run"
+            else -> null
+        }
+        if (output.isNotEmpty() || how != null) {
+            Row(Modifier.padding(start = 4.dp, top = 2.dp)) {
+                Text("⎿  ", color = Palette.Dim, fontSize = 12.sp)
+                Column {
+                    if (output.isNotEmpty()) {
+                        Text(shown, color = Palette.Dim, fontSize = 12.sp, lineHeight = 16.sp)
+                        if (!expanded && lines.size > 4) {
+                            Text("… +${lines.size - 4} lines (tap to expand)", color = Palette.Dim, fontSize = 11.sp)
+                        }
+                    }
+                    if (how != null && how != "approved") Text(how, color = Palette.Error, fontSize = 11.sp)
+                }
+            }
+        }
+    }
+}
+
+/** Replaces the prompt while a tool call waits for a decision. The prompt text becomes the deny note. */
+@Composable
+private fun ApprovalCard(
+    pending: PendingApproval,
+    onAllow: () -> Unit,
+    onAlways: () -> Unit,
+    onDeny: (String?) -> Unit,
+    note: String,
+    onNote: (String) -> Unit,
+) {
+    val args = remember(pending.arguments) { runCatching { JSONObject(pending.arguments) }.getOrDefault(JSONObject()) }
+    val detail = when (pending.name) {
+        "bash" -> args.optString("command")
+        "write_file" -> args.optString("content").let { if (it.length > 1500) it.take(1500) + "\n…" else it }
+        "edit_file" -> "- " + args.optString("old_string").replace("\n", "\n- ") +
+            "\n+ " + args.optString("new_string").replace("\n", "\n+ ")
+        else -> args.toString(2)
+    }
+    Column(
+        Modifier
+            .background(Palette.Bg)
+            .navigationBarsPadding()
+            .imePadding()
+            .padding(horizontal = 10.dp, vertical = 6.dp)
+            .border(1.dp, Palette.Accent, RoundedCornerShape(8.dp))
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text("Allow ${pending.label}?", color = Palette.Accent, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+        if (detail.isNotBlank()) {
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 220.dp)
+                    .background(Palette.Surface, RoundedCornerShape(6.dp))
+                    .verticalScroll(rememberScrollState())
+                    .padding(8.dp)
+            ) {
+                Text(detail, color = Palette.Code, fontSize = 12.sp, lineHeight = 16.sp)
+            }
+        }
+        BasicTextField(
+            value = note,
+            onValueChange = onNote,
+            modifier = Modifier
+                .fillMaxWidth()
+                .border(1.dp, Palette.Border, RoundedCornerShape(6.dp))
+                .padding(8.dp),
+            textStyle = TextStyle(color = Palette.Text, fontSize = 13.sp, fontFamily = FontFamily.Monospace),
+            cursorBrush = SolidColor(Palette.Accent),
+            decorationBox = { field ->
+                if (note.isEmpty()) Text("optional note if you deny…", color = Palette.Dim, fontSize = 13.sp)
+                field()
+            },
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = onAllow, contentPadding = PaddingValues(horizontal = 14.dp)) { Text("Allow") }
+            OutlinedButton(onClick = onAlways, contentPadding = PaddingValues(horizontal = 12.dp)) {
+                Text("Always", fontSize = 13.sp)
+            }
+            OutlinedButton(onClick = { onDeny(note.trim().ifEmpty { null }) }, contentPadding = PaddingValues(horizontal = 12.dp)) {
+                Text("Deny", color = Palette.Error, fontSize = 13.sp)
+            }
+        }
+        Text("Always = allow ${pending.name} for the rest of this session", color = Palette.Dim, fontSize = 11.sp)
     }
 }
 
@@ -275,6 +426,7 @@ private fun PromptBar(
     onSubmit: () -> Unit,
     onStop: () -> Unit,
     onModel: () -> Unit,
+    onMode: () -> Unit,
 ) {
     Column(
         Modifier
@@ -342,6 +494,16 @@ private fun PromptBar(
                 Modifier.clickable(enabled = state.connected) { onModel() },
                 color = Palette.Dim, fontSize = 11.sp,
             )
+            val session = state.session
+            if (session?.agent == true) {
+                // Tap to cycle ask → auto-read → auto, like shift+tab in Claude Code.
+                Text(
+                    "  ·  ${session.permissionMode}",
+                    Modifier.clickable(enabled = state.connected) { onMode() },
+                    color = if (session.permissionMode == "auto") Palette.Error else Palette.Accent,
+                    fontSize = 11.sp,
+                )
+            }
             Spacer(Modifier.weight(1f))
             Text("/ for commands", color = Palette.Dim, fontSize = 11.sp)
         }

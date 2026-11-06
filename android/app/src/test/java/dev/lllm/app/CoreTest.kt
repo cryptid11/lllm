@@ -4,6 +4,7 @@ import dev.lllm.app.data.SshKeys
 import dev.lllm.app.relay.ChatMessage
 import dev.lllm.app.relay.SessionDetail
 import dev.lllm.app.relay.SessionSummary
+import dev.lllm.app.relay.toolLabel
 import dev.lllm.app.ui.UiState
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -51,6 +52,42 @@ class CoreTest {
         assertEquals("", list[0].title)
         assertTrue(list[0].generating)
         assertEquals(false, list[0].archived)
+    }
+
+    @Test
+    fun parsesAgentSession() {
+        // Shape produced by the relay for an agent turn waiting on approval.
+        val data = JSONObject(
+            """{"session": {"id": "s1", "title": "t", "provider": "p", "model": "m", "generating": true,
+               "agent": true, "permission_mode": "ask", "cwd": "/home/rod",
+               "pending_approval": {"call_id": "c2", "name": "bash", "arguments": {"command": "rm -rf build"}},
+               "messages": [
+                 {"role": "user", "content": "clean up"},
+                 {"role": "assistant", "content": "", "tool_calls": [
+                   {"id": "c1", "type": "function", "function": {"name": "list_dir", "arguments": "{}"}},
+                   {"id": "c2", "type": "function", "function": {"name": "bash", "arguments": "{\"command\": \"rm -rf build\"}"}}]},
+                 {"role": "tool", "tool_call_id": "c1", "name": "list_dir", "content": "build/", "ok": true, "approval": "auto"}]}}"""
+        )
+        val s = SessionDetail.from(data)
+        assertTrue(s.agent)
+        assertEquals("ask", s.permissionMode)
+        assertEquals("Bash(rm -rf build)", s.pendingApproval?.label)
+        assertEquals("s1", s.pendingApproval?.session)
+        val calls = s.messages[1].toolCalls
+        assertEquals(listOf("List(.)", "Bash(rm -rf build)"), calls.map { it.label })
+        val result = s.messages[2]
+        assertTrue(result.isTool)
+        assertEquals("c1", result.toolCallId)
+        assertEquals(true, result.ok)
+        assertEquals("auto", result.approval)
+    }
+
+    @Test
+    fun toolLabelsAreShortOneLiners() {
+        assertEquals("Edit(src/a.py)", toolLabel("edit_file", """{"path": "src/a.py", "old_string": "x"}"""))
+        assertEquals("Bash(echo one)", toolLabel("bash", """{"command": "echo one\necho two"}"""))
+        assertEquals(78, toolLabel("bash", """{"command": "${"x".repeat(200)}"}""").length - "Bash()".length)
+        assertEquals("mystery(…)", toolLabel("mystery", "not json"))
     }
 
     @Test

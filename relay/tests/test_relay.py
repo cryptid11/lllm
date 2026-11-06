@@ -113,7 +113,7 @@ class RelayTest(unittest.TestCase):
 
     def test_hello_and_models(self):
         self.assertEqual(self.client.hello["type"], "hello")
-        self.assertEqual(self.client.hello["protocol"], 1)
+        self.assertEqual(self.client.hello["protocol"], 2)
         models = self.client.call("list_models")["data"]["models"]
         self.assertIn("qwen-mock:latest", models)
 

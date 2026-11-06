@@ -11,12 +11,18 @@ Backends are pluggable: native Ollama, or anything OpenAI-compatible
 from __future__ import annotations
 
 import argparse
+import codecs
+import fnmatch
+import getpass
 import http.client
 import json
 import os
+import platform
 import re
+import shlex
 import signal
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -25,8 +31,8 @@ import urllib.parse
 import uuid
 from pathlib import Path
 
-VERSION = "0.1.0"
-PROTOCOL_VERSION = 1
+VERSION = "0.2.0"
+PROTOCOL_VERSION = 2
 
 CONFIG_PATH = Path(os.environ.get("LLLM_CONFIG", "~/.config/lllm/config.json")).expanduser()
 
@@ -46,6 +52,20 @@ DEFAULT_CONFIG = {
     "request_timeout": 900,
     # Seconds between saves of a reply that is still being generated.
     "partial_save_interval": 2.0,
+    "agent": {
+        # New sessions get tools (shell, files) on this machine.
+        "enabled": True,
+        # ask: approve every tool call; auto-read: reading/searching is automatic; auto: nothing asks.
+        "permission_mode": "auto-read",
+        # Initial working directory of new sessions.
+        "workdir": "~",
+        # If set, file tools refuse paths outside this folder (bash is not confined).
+        "confine_to": None,
+        # Model turns per message before the relay stops the loop.
+        "max_steps": 40,
+        # Seconds a tool call waits for approval before it is refused.
+        "approval_timeout": 3600,
+    },
 }
 
 
@@ -72,6 +92,7 @@ def load_config(path: Path = CONFIG_PATH) -> dict:
         if not isinstance(user, dict):
             raise RelayError(f"{path}: config must be a JSON object")
         cfg.update(user)
+        cfg["agent"] = {**DEFAULT_CONFIG["agent"], **(user.get("agent") or {})}
     return cfg
 
 
@@ -177,8 +198,12 @@ def iter_lines(resp, token):
 
 # --------------------------------------------------------------------------- providers
 #
-# A provider turns a list of {"role", "content"} messages into a stream of
-# ("content", text), ("thinking", text) and ("stats", dict) tuples.
+# A provider turns OpenAI-format messages (and optional OpenAI-format tool specs) into a stream of
+# ("content", text), ("thinking", text), ("tool_call", {id, name, arguments}) and ("stats", dict).
+
+
+def _new_call_id():
+    return f"call_{uuid.uuid4().hex[:16]}"
 
 
 class OllamaProvider:
@@ -194,8 +219,33 @@ class OllamaProvider:
         data = http_json("GET", f"{self.base}/api/tags", timeout=15)
         return [m["name"] for m in data.get("models", [])]
 
-    def stream_chat(self, model, messages, opts, token):
-        payload = {"model": model, "messages": messages, "stream": True}
+    @staticmethod
+    def _messages(messages):
+        """Ollama wants tool arguments as objects and tool results tagged with the tool's name."""
+        names, out = {}, []
+        for m in messages:
+            m = dict(m)
+            if m.get("tool_calls"):
+                calls = []
+                for c in m["tool_calls"]:
+                    names[c["id"]] = c["function"]["name"]
+                    try:
+                        args = json.loads(c["function"].get("arguments") or "{}")
+                    except ValueError:
+                        args = {}
+                    calls.append({"function": {"name": c["function"]["name"], "arguments": args}})
+                m["tool_calls"] = calls
+            if m.get("role") == "tool":
+                m = {"role": "tool", "content": m.get("content", ""), "tool_name": names.get(m.get("tool_call_id"), "")}
+            if m.get("content") is None:
+                m["content"] = ""
+            out.append(m)
+        return out
+
+    def stream_chat(self, model, messages, opts, token, tools=None):
+        payload = {"model": model, "messages": self._messages(messages), "stream": True}
+        if tools:
+            payload["tools"] = tools
         options = {**self.cfg.get("options", {}), **opts.get("options", {})}
         if options:
             payload["options"] = options
@@ -217,6 +267,10 @@ class OllamaProvider:
                     yield "thinking", msg["thinking"]
                 if msg.get("content"):
                     yield "content", msg["content"]
+                for c in msg.get("tool_calls") or []:
+                    fn = c.get("function") or {}
+                    yield "tool_call", {"id": c.get("id") or _new_call_id(), "name": fn.get("name", ""),
+                                        "arguments": json.dumps(fn.get("arguments") or {})}
                 if obj.get("done"):
                     yield "stats", self._stats(obj)
                     return
@@ -262,15 +316,18 @@ class OpenAIProvider:
         data = http_json("GET", f"{self.base}/models", headers=self._headers(), timeout=15)
         return [m["id"] for m in data.get("data", [])]
 
-    def stream_chat(self, model, messages, opts, token):
+    def stream_chat(self, model, messages, opts, token, tools=None):
         payload = {"model": model, "messages": messages, "stream": True,
                    **self.cfg.get("params", {}), **opts.get("params", {})}
+        if tools:
+            payload["tools"] = tools
         if self.cfg.get("include_usage", True):
             payload["stream_options"] = {"include_usage": True}
 
         conn, resp = http_request("POST", f"{self.base}/chat/completions", payload,
                                   headers=self._headers(), timeout=self.timeout, token=token)
         stats = {}
+        calls = {}  # index -> {id, name, arguments}; arguments arrive in fragments
         first = last = None
         try:
             for line in iter_lines(resp, token):
@@ -289,23 +346,348 @@ class OpenAIProvider:
                 for choice in obj.get("choices") or []:
                     delta = choice.get("delta") or {}
                     reasoning = delta.get("reasoning_content") or delta.get("reasoning")
-                    if reasoning or delta.get("content"):
+                    if reasoning or delta.get("content") or delta.get("tool_calls"):
                         last = time.monotonic()
                         first = first or last
                     if reasoning:
                         yield "thinking", reasoning
                     if delta.get("content"):
                         yield "content", delta["content"]
+                    for tc in delta.get("tool_calls") or []:
+                        call = calls.setdefault(tc.get("index", len(calls)), {"id": "", "name": "", "arguments": ""})
+                        fn = tc.get("function") or {}
+                        if tc.get("id"):
+                            call["id"] = tc["id"]
+                        if fn.get("name") and not call["name"]:
+                            call["name"] = fn["name"]
+                        if fn.get("arguments"):
+                            call["arguments"] += fn["arguments"]
                     if choice.get("finish_reason"):
                         stats["done_reason"] = choice["finish_reason"]
         finally:
             conn.close()
+        for i in sorted(calls):
+            call = calls[i]
+            yield "tool_call", {**call, "id": call["id"] or _new_call_id()}
         if stats.get("eval_count") and first and last and last > first:
             stats["tokens_per_sec"] = round(stats["eval_count"] / (last - first), 2)
         yield "stats", stats
 
 
 PROVIDER_TYPES = {"ollama": OllamaProvider, "openai": OpenAIProvider}
+
+
+# --------------------------------------------------------------------------- agent tools
+
+READ_ONLY_TOOLS = {"read_file", "list_dir", "grep"}
+PERMISSION_MODES = ("ask", "auto-read", "auto")
+APPROVAL_DECISIONS = ("allow", "allow_session", "deny")
+MAX_TOOL_OUTPUT = 30_000  # characters of a tool result sent to the model
+MAX_LIVE_OUTPUT = 100_000  # characters of bash output streamed to the client per call
+SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".cache", ".gradle", "build", "dist"}
+
+AGENT_PROMPT = """You are an agent with tools on the machine "{host}" (user {user}, {os}).
+Working directory: {cwd}
+Today is {date}.
+
+Use the tools to look things up and make changes instead of guessing: read files before editing them,
+and run commands to check your work. Use edit_file for changes to existing files and write_file for new ones.
+The user may have to approve each command or change from their phone, so avoid unnecessary calls,
+and never run destructive commands (deleting data, force-pushing, killing services...) unless asked.
+Keep answers short: the user reads them on a phone. Put code in fenced code blocks."""
+
+
+def _fn(name, description, properties, required):
+    return {"type": "function", "function": {
+        "name": name, "description": description,
+        "parameters": {"type": "object", "properties": properties, "required": required}}}
+
+
+TOOL_SPECS = [
+    _fn("bash", "Run a bash command on the server. Returns stdout and stderr together, then the exit code. "
+                "Runs in the working directory, and `cd` persists between calls. There is no stdin or TTY, "
+                "so do not start interactive programs. Long output is truncated in the middle.",
+        {"command": {"type": "string", "description": "The command to run"},
+         "timeout": {"type": "integer", "description": "Seconds before the command is killed (default 120, max 600)"}},
+        ["command"]),
+    _fn("read_file", "Read a text file. Returns numbered lines; use offset and limit for large files.",
+        {"path": {"type": "string"},
+         "offset": {"type": "integer", "description": "First line to read, 1-based"},
+         "limit": {"type": "integer", "description": "Maximum number of lines (default 2000)"}},
+        ["path"]),
+    _fn("write_file", "Create or overwrite a file with the given content. Parent directories are created.",
+        {"path": {"type": "string"}, "content": {"type": "string"}},
+        ["path", "content"]),
+    _fn("edit_file", "Replace an exact piece of text in a file. old_string must appear exactly once "
+                     "(including whitespace) unless replace_all is true. Read the file first.",
+        {"path": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"},
+         "replace_all": {"type": "boolean"}},
+        ["path", "old_string", "new_string"]),
+    _fn("list_dir", "List a directory; directory names end with /.",
+        {"path": {"type": "string", "description": "Defaults to the working directory"}},
+        []),
+    _fn("grep", "Search file contents recursively with a Python regular expression.",
+        {"pattern": {"type": "string"},
+         "path": {"type": "string", "description": "File or directory to search (default: working directory)"},
+         "glob": {"type": "string", "description": "Only search files whose name matches, e.g. *.py"}},
+        ["pattern"]),
+]
+TOOL_NAMES = {t["function"]["name"] for t in TOOL_SPECS}
+
+
+def truncate(text, limit=MAX_TOOL_OUTPUT):
+    if len(text) <= limit:
+        return text
+    half = limit // 2
+    return f"{text[:half]}\n\n[... {len(text) - limit} characters omitted ...]\n\n{text[-half:]}"
+
+
+class ToolError(Exception):
+    """A tool failed in a way the model should be told about."""
+
+
+class ToolRunner:
+    """Executes tool calls in a working directory (`cwd`, updated by `cd` in bash)."""
+
+    def __init__(self, cwd, stop=lambda: False, on_output=None, confine=None):
+        self.cwd = cwd
+        self.stop = stop
+        self.on_output = on_output or (lambda text: None)
+        self.confine = Path(confine).expanduser().resolve() if confine else None
+
+    def run(self, name, args):
+        """Returns (ok, output); tool failures become ok=False with an explanation."""
+        fn = getattr(self, f"tool_{name}", None) if name in TOOL_NAMES else None
+        if fn is None:
+            return False, f"Unknown tool: {name}"
+        if not isinstance(args, dict):
+            return False, "Tool arguments must be a JSON object"
+        try:
+            return True, fn(**args)
+        except ToolError as e:
+            return False, str(e)
+        except TypeError as e:
+            return False, f"Bad arguments for {name}: {e}"
+        except (OSError, ValueError) as e:
+            return False, f"{type(e).__name__}: {e}"
+
+    def _path(self, path, must_exist=False):
+        if not isinstance(path, str) or not path:
+            raise ToolError("path is required")
+        p = Path(os.path.expanduser(path))
+        if not p.is_absolute():
+            p = Path(self.cwd) / p
+        p = Path(os.path.normpath(p))
+        if self.confine:
+            real = p.resolve()
+            if real != self.confine and self.confine not in real.parents:
+                raise ToolError(f"{p} is outside the allowed folder {self.confine}")
+        if must_exist and not p.exists():
+            raise ToolError(f"No such file or directory: {p}")
+        return p
+
+    @staticmethod
+    def _kill(proc):
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(proc.pid, sig)
+            except OSError:
+                return
+            try:
+                proc.wait(2)
+                return
+            except subprocess.TimeoutExpired:
+                continue
+
+    def tool_bash(self, command, timeout=120):
+        if not isinstance(command, str) or not command.strip():
+            raise ToolError("command is required")
+        try:
+            timeout = max(1, min(int(timeout), 600))
+        except (TypeError, ValueError):
+            timeout = 120
+        fd, pwd_file = tempfile.mkstemp(prefix="lllm-pwd-")
+        os.close(fd)
+        # The EXIT trap records where the command ended up, so `cd` carries over to the next call.
+        script = f"trap 'pwd -P > {shlex.quote(pwd_file)}' EXIT\n{command}"
+        env = {**os.environ, "TERM": "dumb", "PAGER": "cat", "GIT_PAGER": "cat", "NO_COLOR": "1"}
+        head, tail, limit = bytearray(), bytearray(), MAX_TOOL_OUTPUT * 4
+        try:
+            proc = subprocess.Popen(["bash", "-c", script], cwd=self.cwd, env=env, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+
+            def pump():
+                decoder = codecs.getincrementaldecoder("utf-8")("replace")
+                streamed = 0
+                while True:
+                    data = proc.stdout.read1(65536)
+                    if not data:
+                        break
+                    if len(head) < limit:
+                        head.extend(data)
+                    else:
+                        tail.extend(data)
+                        del tail[:-limit]
+                    if streamed < MAX_LIVE_OUTPUT:
+                        text = decoder.decode(data)
+                        streamed += len(text)
+                        self.on_output(text)
+
+            reader = threading.Thread(target=pump, daemon=True)
+            reader.start()
+            deadline = time.monotonic() + timeout
+            stopped = None
+            while proc.poll() is None:
+                if self.stop():
+                    stopped = "cancelled by the user"
+                elif time.monotonic() > deadline:
+                    stopped = f"killed: timed out after {timeout}s"
+                if stopped:
+                    self._kill(proc)
+                    break
+                time.sleep(0.1)
+            proc.wait()
+            reader.join(2)  # a background job may keep the pipe open; don't wait for it
+            try:
+                new_cwd = Path(pwd_file).read_text().strip()
+                if new_cwd and os.path.isdir(new_cwd):
+                    self.cwd = new_cwd
+            except OSError:
+                pass
+        finally:
+            try:
+                os.unlink(pwd_file)
+            except OSError:
+                pass
+        out = head.decode("utf-8", "replace")
+        if tail:
+            out += "\n[... output truncated ...]\n" + tail.decode("utf-8", "replace")
+        out = truncate(out.rstrip("\n"))
+        status = f"[{stopped}]" if stopped else f"[exit code {proc.returncode}]"
+        return f"{out}\n{status}" if out else status
+
+    def tool_read_file(self, path, offset=1, limit=2000):
+        p = self._path(path, must_exist=True)
+        if p.is_dir():
+            raise ToolError(f"{p} is a directory; use list_dir")
+        if p.stat().st_size > 20_000_000:
+            raise ToolError(f"{p} is too large to read ({p.stat().st_size} bytes); use bash with head/grep")
+        data = p.read_bytes()
+        if b"\0" in data[:8192]:
+            raise ToolError(f"{p} looks like a binary file")
+        lines = data.decode("utf-8", "replace").splitlines()
+        if not lines:
+            return f"({p} is empty)"
+        offset = max(1, int(offset or 1))
+        limit = max(1, min(int(limit or 2000), 5000))
+        chunk = lines[offset - 1:offset - 1 + limit]
+        body = "\n".join(f"{n:>6}\t{line[:2000]}" for n, line in enumerate(chunk, start=offset))
+        remaining = len(lines) - (offset - 1 + len(chunk))
+        if remaining > 0:
+            body += f"\n[{remaining} more lines; continue with offset={offset + len(chunk)}]"
+        return truncate(body, 100_000)
+
+    def tool_write_file(self, path, content):
+        if not isinstance(content, str):
+            raise ToolError("content must be a string")
+        p = self._path(path)
+        if p.is_dir():
+            raise ToolError(f"{p} is a directory")
+        existed = p.exists()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        verb = "Overwrote" if existed else "Created"
+        return f"{verb} {p} ({len(content.splitlines())} lines, {len(content.encode())} bytes)"
+
+    def tool_edit_file(self, path, old_string, new_string, replace_all=False):
+        if not isinstance(old_string, str) or not isinstance(new_string, str) or not old_string:
+            raise ToolError("old_string (non-empty) and new_string must be strings")
+        p = self._path(path, must_exist=True)
+        text = p.read_text(encoding="utf-8")
+        count = text.count(old_string)
+        if count == 0:
+            raise ToolError("old_string was not found; it must match the file exactly, including whitespace")
+        if count > 1 and not replace_all:
+            raise ToolError(f"old_string appears {count} times; include more context or set replace_all")
+        p.write_text(text.replace(old_string, new_string, -1 if replace_all else 1), encoding="utf-8")
+        return f"Edited {p} ({count if replace_all else 1} replacement{'s' if replace_all and count > 1 else ''})"
+
+    def tool_list_dir(self, path="."):
+        p = self._path(path or ".", must_exist=True)
+        if not p.is_dir():
+            raise ToolError(f"{p} is not a directory")
+        entries = sorted(p.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower()))
+        lines = []
+        for e in entries[:1000]:
+            try:
+                lines.append(f"{e.name}/" if e.is_dir() else f"{e.name}  ({e.stat().st_size} bytes)")
+            except OSError:
+                lines.append(e.name)
+        more = f"\n[{len(entries) - 1000} more entries]" if len(entries) > 1000 else ""
+        return f"{p}:\n" + ("\n".join(lines) or "(empty)") + more
+
+    def tool_grep(self, pattern, path=".", glob=None):
+        try:
+            rx = re.compile(pattern)
+        except (re.error, TypeError) as e:
+            raise ToolError(f"invalid regular expression: {e}")
+        base = self._path(path or ".", must_exist=True)
+        files = [base] if base.is_file() else self._walk(base, glob)
+        hits = []
+        for f in files:
+            if self.stop():
+                break
+            try:
+                if f.stat().st_size > 2_000_000:
+                    continue
+                data = f.read_bytes()
+            except OSError:
+                continue
+            if b"\0" in data[:8192]:
+                continue
+            name = os.path.relpath(f, base) if base.is_dir() else f.name
+            for n, line in enumerate(data.decode("utf-8", "replace").splitlines(), start=1):
+                if rx.search(line):
+                    hits.append(f"{name}:{n}: {line.strip()[:300]}")
+                    if len(hits) >= 200:
+                        return "\n".join(hits) + "\n[stopped at 200 matches]"
+        return "\n".join(hits) or "No matches"
+
+    @staticmethod
+    def _walk(base, glob):
+        seen = 0
+        for root, dirs, names in os.walk(base):
+            dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
+            for name in sorted(names):
+                if glob and not fnmatch.fnmatch(name, glob):
+                    continue
+                seen += 1
+                if seen > 20_000:
+                    return
+                yield Path(root) / name
+
+
+class StopCheck:
+    """True once the user stopped this reply: locally (token) or from any connection (session flag)."""
+
+    def __init__(self, store, sid, token):
+        self.store, self.sid, self.token = store, sid, token
+        self._next_check = 0.0
+
+    def __call__(self):
+        if self.token.cancelled:
+            return True
+        now = time.monotonic()
+        if now >= self._next_check:
+            self._next_check = now + 1.0
+            try:
+                flagged = bool(self.store.load(self.sid).get("cancel_requested"))
+            except RelayError:  # deleted
+                flagged = True
+            if flagged:
+                self.token.cancel()
+                return True
+        return False
 
 
 # --------------------------------------------------------------------------- sessions
@@ -342,6 +724,7 @@ def summarize(session) -> dict:
         "preview": (last["content"][:120] if last else ""),
         "generating": is_generating(session),
         "archived": bool(session.get("archived")),
+        "agent": bool(session.get("agent")),
     }
 
 
@@ -381,6 +764,9 @@ class SessionStore:
             for m in session.get("messages", []):
                 if m.pop("partial", None):
                     m["status"] = "interrupted"
+        if not session.get("generating"):
+            session.pop("pending_approval", None)
+            session.pop("cancel_requested", None)
 
     def save(self, session, durable=True, touch=True):
         """Write atomically. `touch` bumps `updated`, which orders the session list by activity."""
@@ -468,7 +854,11 @@ class Engine:
         p = self.provider(provider)
         return {"provider": p.name, "models": p.list_models()}
 
-    def new_session(self, title=None, provider=None, model=None, system=None, options=None):
+    @property
+    def agent_cfg(self):
+        return self.cfg.get("agent") or DEFAULT_CONFIG["agent"]
+
+    def new_session(self, title=None, provider=None, model=None, system=None, options=None, agent=None):
         p = self.provider(provider)
         now = time.time()
         session = {
@@ -480,14 +870,22 @@ class Engine:
             "model": model or self.default_model(p),
             "system": system,
             "options": options or {},
+            "agent": bool(self.agent_cfg.get("enabled")) if agent is None else bool(agent),
+            "permission_mode": self.agent_cfg.get("permission_mode", "auto-read"),
+            "cwd": self._default_cwd(),
             "messages": [],
         }
         with self.store.lock:
             self.store.save(session)
         return session
 
+    def _default_cwd(self):
+        cwd = os.path.expanduser(self.agent_cfg.get("workdir") or "~")
+        return cwd if os.path.isdir(cwd) else os.path.expanduser("~")
+
     def update_session(self, sid, **changes):
-        allowed = {"title", "provider", "model", "system", "options", "archived"}
+        allowed = {"title", "provider", "model", "system", "options", "archived",
+                   "agent", "permission_mode", "cwd", "allowed_tools"}
         with self.store.lock:
             session = self.store.load(sid)
             for key, value in changes.items():
@@ -499,28 +897,72 @@ class Engine:
                     if not isinstance(value, str):
                         raise RelayError("title must be a string")
                     value = " ".join(value.split())[:200]
-                if key == "archived" and not isinstance(value, bool):
-                    raise RelayError("archived must be true or false")
+                if key in ("archived", "agent") and not isinstance(value, bool):
+                    raise RelayError(f"{key} must be true or false")
+                if key == "permission_mode" and value not in PERMISSION_MODES:
+                    raise RelayError(f"permission_mode must be one of {', '.join(PERMISSION_MODES)}")
+                if key == "cwd":
+                    if not isinstance(value, str):
+                        raise RelayError("cwd must be a string")
+                    base = session.get("cwd") or self._default_cwd()
+                    value = os.path.normpath(os.path.join(base, os.path.expanduser(value)))
+                    if not os.path.isdir(value):
+                        raise RelayError(f"not a directory: {value}")
+                if key == "allowed_tools" and not (isinstance(value, list) and all(isinstance(t, str) for t in value)):
+                    raise RelayError("allowed_tools must be a list of tool names")
                 session[key] = value
             # Renaming or archiving is not activity: keep the session's place in the list.
             self.store.save(session, touch=False)
         return session
 
-    def _history(self, session, upto):
+    def _system_prompt(self, session):
         system = session.get("system")
         if system is None:
             system = self.cfg.get("system_prompt")
+        if session.get("agent"):
+            agent = AGENT_PROMPT.format(
+                host=socket.gethostname(), user=getpass.getuser(),
+                os=f"{platform.system()} {platform.release()} {platform.machine()}",
+                cwd=session.get("cwd") or self._default_cwd(), date=time.strftime("%Y-%m-%d"),
+            )
+            system = f"{system}\n\n{agent}" if system else agent
+        return system
+
+    def _history(self, session, upto):
+        """Messages before index `upto`, in OpenAI chat format."""
+        system = self._system_prompt(session)
         msgs = [{"role": "system", "content": system}] if system else []
-        for m in session["messages"][:upto]:
-            if m.get("role") in ("user", "assistant") and m.get("content"):
-                msgs.append({"role": m["role"], "content": m["content"]})
+        stored = session["messages"][:upto]
+        answered = {m.get("tool_call_id") for m in stored if m.get("role") == "tool"}
+        for m in stored:
+            role = m.get("role")
+            if role == "user" and m.get("content"):
+                msgs.append({"role": "user", "content": m["content"]})
+            elif role == "assistant":
+                calls = m.get("tool_calls") or []
+                if not m.get("content") and not calls:
+                    continue
+                msg = {"role": "assistant", "content": m.get("content") or None}
+                if calls:
+                    msg["tool_calls"] = calls
+                msgs.append(msg)
+                # A reply interrupted between a call and its result: every call needs a result.
+                for c in calls:
+                    if c["id"] not in answered:
+                        msgs.append({"role": "tool", "tool_call_id": c["id"], "content": "[no result: interrupted]"})
+            elif role == "tool":
+                msgs.append({"role": "tool", "tool_call_id": m.get("tool_call_id"), "content": m.get("content", "")})
         return msgs
 
-    def chat(self, sid, text, emit, token):
-        """Append a user message, stream the reply through emit(), and persist it.
+    @staticmethod
+    def _placeholder(model):
+        return {"role": "assistant", "content": "", "ts": time.time(), "model": model, "partial": True}
 
-        The reply is saved as it is produced, and the generation runs to completion
-        even if the client disconnects, so a reconnecting client finds the full answer.
+    def chat(self, sid, text, emit, token):
+        """Run one user message to completion: model turns, and tool calls in agent sessions.
+
+        Everything is saved as it happens, and the work continues if the client disconnects,
+        so a reconnecting client finds the result (or a pending approval) in the session.
         """
         if not isinstance(text, str) or not text.strip():
             raise RelayError("empty message")
@@ -530,26 +972,56 @@ class Engine:
                 raise RelayError("this session is already generating a reply")
             provider = self.provider(session.get("provider"))
             model = session.get("model") or self.default_model(provider)
-            now = time.time()
-            session["messages"].append({"role": "user", "content": text, "ts": now})
-            session["messages"].append({"role": "assistant", "content": "", "ts": now,
-                                        "model": model, "partial": True})
+            session["messages"].append({"role": "user", "content": text, "ts": time.time()})
+            session["messages"].append(self._placeholder(model))
             if not session.get("title"):
                 session["title"] = make_title(text)
-            session["generating"] = {"pid": os.getpid(), "since": now}
+            session["generating"] = {"pid": os.getpid(), "since": time.time()}
+            session.pop("cancel_requested", None)
+            session.pop("pending_approval", None)
             self.store.save(session)
             index = len(session["messages"]) - 1
-        history = self._history(session, index)
 
-        emit({"type": "start", "session": sid, "index": index, "model": model,
-              "provider": provider.name})
-        content, thinking, stats = [], [], {}
+        emit({"type": "start", "session": sid, "index": index, "model": model, "provider": provider.name})
+        stop = StopCheck(self.store, sid, token)
+        max_steps = int(self.agent_cfg.get("max_steps", 40))
+        steps = 0
+        while True:
+            steps += 1
+            status, error, calls = self._model_turn(sid, index, provider, model, emit, token, stop)
+            if status != "done" or not calls:
+                break
+            status = self._run_tools(sid, calls, emit, stop)
+            if status != "done":
+                break
+            if steps >= max_steps:
+                status, error = "error", f"stopped after {max_steps} steps (agent.max_steps)"
+                break
+            with self.store.lock:
+                session = self.store.load(sid)
+                session["messages"].append(self._placeholder(model))
+                self.store.save(session)
+                index = len(session["messages"]) - 1
+            emit({"type": "turn", "index": index})
+
+        message = self._finish(sid, index, status, error)
+        emit({"type": "end", "status": status, "error": error, "index": index, "message": message})
+        return message
+
+    def _model_turn(self, sid, index, provider, model, emit, token, stop):
+        """Stream one model response into messages[index]. Returns (status, error, tool_calls)."""
+        with self.store.lock:
+            session = self.store.load(sid)
+        history = self._history(session, index)
+        tools = TOOL_SPECS if session.get("agent") else None
+        content, thinking, calls, stats = [], [], [], {}
         status, error = "done", None
         started = last_save = time.monotonic()
         first_token = None
+        interval = float(self.cfg.get("partial_save_interval", 2.0))
         try:
-            for kind, value in provider.stream_chat(model, history, session.get("options") or {}, token):
-                if first_token is None and kind in ("content", "thinking"):
+            for kind, value in provider.stream_chat(model, history, session.get("options") or {}, token, tools=tools):
+                if first_token is None and kind in ("content", "thinking", "tool_call"):
                     first_token = time.monotonic()
                 if kind == "content":
                     content.append(value)
@@ -557,11 +1029,12 @@ class Engine:
                 elif kind == "thinking":
                     thinking.append(value)
                     emit({"type": "thinking", "text": value})
+                elif kind == "tool_call":
+                    calls.append(value)
                 elif kind == "stats":
                     stats.update(value)
-                if token.cancelled:
+                if stop():
                     raise Cancelled()
-                interval = float(self.cfg.get("partial_save_interval", 2.0))
                 if time.monotonic() - last_save >= interval:
                     self._store_reply(sid, index, "".join(content), "".join(thinking))
                     last_save = time.monotonic()
@@ -575,12 +1048,137 @@ class Engine:
         stats["wall_sec"] = round(time.monotonic() - started, 2)
         if first_token is not None:
             stats["ttft_sec"] = round(first_token - started, 2)
-        message = self._store_reply(sid, index, "".join(content), "".join(thinking),
-                                    final=True, status=status, error=error, stats=stats)
-        emit({"type": "end", "status": status, "error": error, "index": index, "message": message})
-        return message
+        tool_calls = [{"id": c["id"], "type": "function",
+                       "function": {"name": c["name"], "arguments": c["arguments"] or "{}"}}
+                      for c in calls] if status == "done" else []
+        self._store_reply(sid, index, "".join(content), "".join(thinking), final=True,
+                          status=status, error=error, stats=stats, tool_calls=tool_calls)
+        return status, error, tool_calls
 
-    def _store_reply(self, sid, index, content, thinking, final=False, status=None, error=None, stats=None):
+    def _needs_approval(self, session, name):
+        if name not in TOOL_NAMES:
+            return False  # fails without running anything
+        mode = session.get("permission_mode") or self.agent_cfg.get("permission_mode", "auto-read")
+        if mode == "auto" or (mode == "auto-read" and name in READ_ONLY_TOOLS):
+            return False
+        return name not in (session.get("allowed_tools") or [])
+
+    def _run_tools(self, sid, calls, emit, stop):
+        """Run (or refuse) each tool call and store its result. Returns "done" or "cancelled"."""
+        status = "done"
+        for call in calls:
+            cid, name = call["id"], call["function"]["name"]
+            raw = call["function"].get("arguments") or "{}"
+            try:
+                args = json.loads(raw)
+            except ValueError:
+                args = None
+            if status != "done":
+                self._add_tool_result(sid, cid, name, False, "[not run: the user stopped the reply]", "cancelled")
+                continue
+            with self.store.lock:
+                session = self.store.load(sid)
+            needs = isinstance(args, dict) and self._needs_approval(session, name)
+            emit({"type": "tool_call", "call_id": cid, "name": name,
+                  "arguments": args if isinstance(args, dict) else raw, "needs_approval": needs})
+            approval = "auto"
+            if not isinstance(args, dict):
+                ok, output = False, f"Invalid tool arguments (expected a JSON object): {raw[:500]}"
+            else:
+                if needs:
+                    approval, note = self._await_approval(sid, cid, name, args, stop)
+                if approval == "cancelled":
+                    status = "cancelled"
+                    ok, output = False, "[not run: the user stopped the reply]"
+                elif approval == "deny":
+                    ok, output = False, "The user denied this tool call." + (f" They said: {note}" if note else "")
+                elif approval == "timeout":
+                    ok, output = False, "Nobody approved this tool call in time, so it was not run."
+                else:
+                    cwd = session.get("cwd") or self._default_cwd()
+                    if not os.path.isdir(cwd):
+                        cwd = os.path.expanduser("~")
+                    runner = ToolRunner(cwd, stop, confine=self.agent_cfg.get("confine_to"),
+                                        on_output=lambda text, cid=cid: emit(
+                                            {"type": "tool_output", "call_id": cid, "text": text}))
+                    ok, output = runner.run(name, args)
+                    if runner.cwd != cwd:
+                        self.update_session(sid, cwd=runner.cwd)
+                    if stop():
+                        status = "cancelled"
+            self._add_tool_result(sid, cid, name, ok, output, approval)
+            emit({"type": "tool_result", "call_id": cid, "ok": ok, "approval": approval,
+                  "output": truncate(output, 4000)})
+        return status
+
+    def _add_tool_result(self, sid, cid, name, ok, output, approval):
+        with self.store.lock:
+            try:
+                session = self.store.load(sid)
+            except RelayError:
+                return
+            session["messages"].append({"role": "tool", "tool_call_id": cid, "name": name, "content": output,
+                                        "ok": ok, "approval": approval, "ts": time.time()})
+            self.store.save(session)
+
+    def _await_approval(self, sid, cid, name, args, stop):
+        """Publish a pending approval in the session and wait for any connection to decide.
+
+        Returns (decision, note): allow, allow_session, deny, timeout or cancelled.
+        """
+        with self.store.lock:
+            session = self.store.load(sid)
+            session["pending_approval"] = {"call_id": cid, "name": name, "arguments": args, "since": time.time()}
+            self.store.save(session, touch=False)
+        deadline = time.monotonic() + float(self.agent_cfg.get("approval_timeout", 3600))
+        while True:
+            cancelled = stop()
+            with self.store.lock:
+                try:
+                    session = self.store.load(sid)
+                except RelayError:
+                    return "cancelled", None
+                pending = session.get("pending_approval") or {}
+                decision = pending.get("decision") if pending.get("call_id") == cid else None
+                if cancelled:
+                    decision = "cancelled"
+                elif decision is None and time.monotonic() > deadline:
+                    decision = "timeout"
+                if decision:
+                    session.pop("pending_approval", None)
+                    if decision == "allow_session":
+                        allowed = session.setdefault("allowed_tools", [])
+                        if name not in allowed:
+                            allowed.append(name)
+                    self.store.save(session, touch=False)
+                    return decision, pending.get("note")
+            time.sleep(0.3)
+
+    def approve(self, sid, call_id, decision, note=None):
+        if decision not in APPROVAL_DECISIONS:
+            raise RelayError(f"decision must be one of {', '.join(APPROVAL_DECISIONS)}")
+        with self.store.lock:
+            session = self.store.load(sid)
+            pending = session.get("pending_approval")
+            if not pending or pending.get("call_id") != call_id:
+                raise RelayError("no pending approval for that tool call")
+            pending["decision"] = decision
+            if note:
+                pending["note"] = str(note)[:2000]
+            self.store.save(session, touch=False)
+
+    def request_cancel(self, sid):
+        """Ask whichever process is generating in this session to stop. Returns False if idle."""
+        with self.store.lock:
+            session = self.store.load(sid)
+            if not is_generating(session):
+                return False
+            session["cancel_requested"] = True
+            self.store.save(session, touch=False)
+        return True
+
+    def _store_reply(self, sid, index, content, thinking, final=False, status=None, error=None, stats=None,
+                     tool_calls=None):
         with self.store.lock:
             try:
                 session = self.store.load(sid)
@@ -595,14 +1193,31 @@ class Engine:
                 msg["thinking"] = thinking
             if final:
                 msg.pop("partial", None)
-                session.pop("generating", None)
                 if status != "done":
                     msg["status"] = status
                 if error:
                     msg["error"] = error
                 if stats:
                     msg["stats"] = stats
+                if tool_calls:
+                    msg["tool_calls"] = tool_calls
             self.store.save(session, durable=final)
+            return msg
+
+    def _finish(self, sid, index, status, error):
+        with self.store.lock:
+            try:
+                session = self.store.load(sid)
+            except RelayError:
+                return None
+            for key in ("generating", "cancel_requested", "pending_approval"):
+                session.pop(key, None)
+            msg = session["messages"][index] if index < len(session["messages"]) else None
+            if msg is not None and status != "done" and not msg.get("status"):
+                msg["status"] = status
+                if error:
+                    msg["error"] = error
+            self.store.save(session)
             return msg
 
 
@@ -618,7 +1233,7 @@ class Server:
         self.out = out
         self.out_lock = threading.Lock()
         self.detached = False
-        self.active = {}  # request id -> CancelToken
+        self.active = {}  # request id -> (CancelToken, session id)
         self.active_lock = threading.Lock()
 
     def send(self, obj):
@@ -686,7 +1301,7 @@ class Server:
 
     def op_new_session(self, rid, req):
         s = self.engine.new_session(req.get("title"), req.get("provider"), req.get("model"),
-                                    req.get("system"), req.get("options"))
+                                    req.get("system"), req.get("options"), req.get("agent"))
         return {"session": s}
 
     def op_get_session(self, rid, req):
@@ -706,7 +1321,7 @@ class Server:
     def op_chat(self, rid, req):
         token = CancelToken()
         with self.active_lock:
-            self.active[rid] = token
+            self.active[rid] = (token, req.get("session"))
         try:
             self.engine.chat(req.get("session"), req.get("text"),
                              lambda ev: self.send({**ev, "id": rid}), token)
@@ -716,11 +1331,18 @@ class Server:
         return None
 
     def op_cancel(self, rid, req):
+        """Stop a reply: `target` (a chat request id on this connection) or `session` (from any connection)."""
+        sid = req.get("session")
         with self.active_lock:
-            token = self.active.get(req.get("target"))
-        if token:
-            token.cancel()
-        return {"cancelled": token is not None}
+            tokens = [t for r, (t, s) in self.active.items() if r == req.get("target") or (sid and s == sid)]
+        for t in tokens:
+            t.cancel()
+        flagged = self.engine.request_cancel(sid) if sid else False
+        return {"cancelled": bool(tokens) or flagged}
+
+    def op_approve(self, rid, req):
+        self.engine.approve(req.get("session"), req.get("call_id"), req.get("decision"), req.get("note"))
+        return {"ok": True}
 
 
 def cmd_serve(args):
@@ -768,6 +1390,17 @@ def cmd_chat(args):
             print(ev["text"], end="", flush=True)
         elif ev["type"] == "thinking":
             print(f"{DIM}{ev['text']}{RESET}", end="", flush=True)
+        elif ev["type"] == "tool_call":
+            print(f"\n● {ev['name']}({json.dumps(ev['arguments'], ensure_ascii=False)[:300]})")
+            if ev["needs_approval"]:
+                answer = input("  allow? [y]es / [a]lways this session / [n]o: ").strip().lower()
+                decision = {"y": "allow", "a": "allow_session"}.get(answer[:1], "deny")
+                engine.approve(session["id"], ev["call_id"], decision)
+        elif ev["type"] == "tool_output":
+            print(f"{DIM}{ev['text']}{RESET}", end="", flush=True)
+        elif ev["type"] == "tool_result":
+            mark = "" if ev["ok"] else " (failed)"
+            print(f"{DIM}  ⎿ {ev['approval']}{mark}{RESET}")
         elif ev["type"] == "end":
             stats = (ev.get("message") or {}).get("stats", {})
             tps = f" · {stats['tokens_per_sec']} tok/s" if stats.get("tokens_per_sec") else ""

@@ -52,6 +52,44 @@ data class SessionSummary(
     }
 }
 
+/** A tool the model asked to run; [arguments] is the raw JSON object text. */
+data class ToolCall(val id: String, val name: String, val arguments: String) {
+    val label: String get() = toolLabel(name, arguments)
+
+    companion object {
+        fun listFrom(arr: JSONArray?): List<ToolCall> = arr?.objects()?.map { c ->
+            val fn = c.optJSONObject("function") ?: JSONObject()
+            ToolCall(c.optString("id"), fn.optString("name"), fn.optString("arguments", "{}"))
+        } ?: emptyList()
+    }
+}
+
+/** A tool call waiting for the user to allow or deny it. */
+data class PendingApproval(val session: String, val callId: String, val name: String, val arguments: String) {
+    val label: String get() = toolLabel(name, arguments)
+}
+
+fun JSONObject.argumentsText(name: String): String =
+    optJSONObject(name)?.toString() ?: optString(name, "{}")
+
+/** Claude Code style one-liner, e.g. Bash(ls -la) or Edit(src/main.py). */
+fun toolLabel(name: String, arguments: String): String {
+    val args = runCatching { JSONObject(arguments) }.getOrDefault(JSONObject())
+    fun arg(key: String): String {
+        val line = args.optString(key).lineSequence().firstOrNull().orEmpty()
+        return if (line.length > 80) line.take(77) + "…" else line
+    }
+    return when (name) {
+        "bash" -> "Bash(${arg("command")})"
+        "read_file" -> "Read(${arg("path")})"
+        "write_file" -> "Write(${arg("path")})"
+        "edit_file" -> "Edit(${arg("path")})"
+        "list_dir" -> "List(${arg("path").ifEmpty { "." }})"
+        "grep" -> "Grep(${arg("pattern")})"
+        else -> "$name(…)"
+    }
+}
+
 data class ChatMessage(
     val role: String,
     val content: String,
@@ -63,8 +101,16 @@ data class ChatMessage(
     val evalCount: Int? = null,
     val tokensPerSec: Double? = null,
     val wallSec: Double? = null,
+    /** Assistant messages: tools the model called. */
+    val toolCalls: List<ToolCall> = emptyList(),
+    /** Tool messages (role "tool"): which call this is the result of; [content] is the output. */
+    val toolCallId: String? = null,
+    val ok: Boolean? = null,
+    /** How the call was cleared: auto, allow, allow_session, deny, timeout or cancelled. */
+    val approval: String? = null,
 ) {
     val isUser get() = role == "user"
+    val isTool get() = role == "tool"
 
     companion object {
         fun from(o: JSONObject): ChatMessage {
@@ -79,6 +125,10 @@ data class ChatMessage(
                 evalCount = stats?.takeIf { it.has("eval_count") && !it.isNull("eval_count") }?.optInt("eval_count"),
                 tokensPerSec = stats?.takeIf { it.has("tokens_per_sec") }?.optDouble("tokens_per_sec"),
                 wallSec = stats?.takeIf { it.has("wall_sec") }?.optDouble("wall_sec"),
+                toolCalls = ToolCall.listFrom(o.optJSONArray("tool_calls")),
+                toolCallId = o.str("tool_call_id"),
+                ok = if (o.has("ok")) o.optBoolean("ok") else null,
+                approval = o.str("approval"),
             )
         }
     }
@@ -91,6 +141,11 @@ data class SessionDetail(
     val model: String,
     val messages: List<ChatMessage>,
     val generating: Boolean,
+    /** Tools enabled for this session. */
+    val agent: Boolean = false,
+    val permissionMode: String = "auto-read",
+    val cwd: String = "",
+    val pendingApproval: PendingApproval? = null,
 ) {
     companion object {
         fun from(data: JSONObject): SessionDetail {
@@ -102,6 +157,12 @@ data class SessionDetail(
                 model = s.str("model") ?: "",
                 messages = s.optJSONArray("messages")?.objects()?.map(ChatMessage::from) ?: emptyList(),
                 generating = s.optBoolean("generating"),
+                agent = s.optBoolean("agent"),
+                permissionMode = s.str("permission_mode") ?: "auto-read",
+                cwd = s.str("cwd") ?: "",
+                pendingApproval = s.optJSONObject("pending_approval")?.let {
+                    PendingApproval(s.getString("id"), it.optString("call_id"), it.optString("name"), it.argumentsText("arguments"))
+                },
             )
         }
     }

@@ -57,7 +57,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def _openai_chat(self, req):
-        last = req["messages"][-1]["content"]
+        msg = req["messages"][-1]
+        last = msg.get("content") or ""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Transfer-Encoding", "chunked")
@@ -65,7 +66,25 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"e\r\n: PROCESSING\n\n\r\n")  # SSE comment, as OpenRouter sends
         self._sse({"choices": [{"delta": {"reasoning": "pondering. "}}]})
         time.sleep(0.05)
-        for word in f"openai-echo: {last}".split(" "):
+        # Agent tests: a user message "tool: NAME {json args}" makes the model call that tool;
+        # a tool result is answered with "result: <first line>".
+        if req.get("tools") and msg["role"] == "user" and last.startswith("tool: "):
+            name, _, args = last[6:].partition(" ")
+            cut = len(args) // 2  # arguments arrive in fragments, as real providers stream them
+            self._sse({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "type": "function", "function": {"name": name, "arguments": args[:cut]}}]}}]})
+            self._sse({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": args[cut:]}}]}}]})
+            self._sse({"choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+                       "usage": {"prompt_tokens": 9, "completion_tokens": 4}})
+            data = b"data: [DONE]\n\n"
+            self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n0\r\n\r\n")
+            return
+        if msg["role"] == "tool":
+            last = "result: " + (last.splitlines() or [""])[0]
+            words = last.split(" ")
+        else:
+            words = f"openai-echo: {last}".split(" ")
+        for word in words:
             self._sse({"choices": [{"delta": {"content": word + " "}}]})
             time.sleep(0.02)
         self._sse({"choices": [{"delta": {}, "finish_reason": "stop"}],

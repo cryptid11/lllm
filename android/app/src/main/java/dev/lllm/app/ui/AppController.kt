@@ -6,10 +6,14 @@ import dev.lllm.app.data.Profile
 import dev.lllm.app.data.ProfileStore
 import dev.lllm.app.relay.ChatMessage
 import dev.lllm.app.relay.Hello
+import dev.lllm.app.relay.PendingApproval
 import dev.lllm.app.relay.RelayClient
 import dev.lllm.app.relay.RelayException
 import dev.lllm.app.relay.SessionDetail
 import dev.lllm.app.relay.SessionSummary
+import dev.lllm.app.relay.ToolCall
+import dev.lllm.app.relay.argumentsText
+import dev.lllm.app.relay.str
 import dev.lllm.app.relay.strings
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -49,6 +53,12 @@ data class UiState(
     val showArchived: Boolean = false,
     /** Sessions swiped away whose delete can still be undone. */
     val pendingDelete: Set<String> = emptySet(),
+    /** A tool call in the open session waiting for Allow/Deny. */
+    val pendingApproval: PendingApproval? = null,
+    /** Bash output streaming in, by tool call id, until its result arrives. */
+    val liveOutput: Map<String, String> = emptyMap(),
+    /** The app is on screen (otherwise approvals also raise a notification). */
+    val appVisible: Boolean = true,
 ) {
     val connected get() = conn is Conn.Up
     val generating get() = generatingSince != null
@@ -225,8 +235,13 @@ class AppController(private val app: Application) {
         _state.update { it.copy(sessions = list) }
     }
 
+    fun setVisible(visible: Boolean) = _state.update { it.copy(appVisible = visible) }
+
     fun openSession(id: String) {
-        _state.update { it.copy(screen = Screen.Chat, session = null, messages = emptyList(), generatingSince = null) }
+        _state.update {
+            it.copy(screen = Screen.Chat, session = null, messages = emptyList(), generatingSince = null,
+                    pendingApproval = null, liveOutput = emptyMap())
+        }
         reloadSession(id)
     }
 
@@ -293,6 +308,8 @@ class AppController(private val app: Application) {
                 session = detail,
                 messages = detail.messages,
                 generatingSince = if (detail.generating) (it.generatingSince ?: System.currentTimeMillis()) else null,
+                pendingApproval = detail.pendingApproval,
+                liveOutput = emptyMap(),
             )
         }
         if (detail.generating) pollWhileGenerating(id)
@@ -305,12 +322,13 @@ class AppController(private val app: Application) {
             while (true) {
                 delay(1500)
                 val detail = SessionDetail.from(c.call("get_session", mapOf("session" to id)))
-                if (s.session?.id != id) return@withClient
+                if (s.session?.id != id || chatId != null) return@withClient
                 _state.update {
                     it.copy(
                         session = detail,
                         messages = detail.messages,
                         generatingSince = if (detail.generating) it.generatingSince else null,
+                        pendingApproval = detail.pendingApproval,
                     )
                 }
                 if (!detail.generating) {
@@ -358,6 +376,26 @@ class AppController(private val app: Application) {
             "/sessions", "/resume" -> goTo(Screen.Sessions)
             "/model" -> if (arg.isNotEmpty()) setModel(arg) else loadModels()
             "/settings" -> goTo(Screen.Setup)
+            "/agent" -> {
+                val on = when (arg.lowercase()) {
+                    "on" -> true
+                    "off" -> false
+                    else -> !(s.session?.agent ?: false)
+                }
+                updateSession(mapOf("agent" to on)) { if (it.agent) "Agent mode on: ${it.permissionMode}" else "Chat only" }
+            }
+            "/mode" -> {
+                val mode = arg.lowercase().ifEmpty { nextMode(s.session?.permissionMode) }
+                if (mode !in MODES) {
+                    notice("Modes: ${MODES.joinToString(", ")}")
+                    return false
+                }
+                updateSession(mapOf("permission_mode" to mode)) { "Permission mode: ${it.permissionMode}" }
+            }
+            "/cd" -> {
+                if (arg.isEmpty()) return false.also { notice("cwd: ${s.session?.cwd}") }
+                updateSession(mapOf("cwd" to arg)) { "cwd: ${it.cwd}" }
+            }
             "/help" -> notice(COMMANDS.joinToString("\n") { "${it.first}  ${it.second}" })
             else -> {
                 notice("Unknown command $name. Try /help")
@@ -365,6 +403,20 @@ class AppController(private val app: Application) {
             }
         }
         return true
+    }
+
+    fun cycleMode() = updateSession(mapOf("permission_mode" to nextMode(s.session?.permissionMode))) {
+        "Permission mode: ${it.permissionMode}"
+    }
+
+    private fun nextMode(mode: String?) = MODES[(MODES.indexOf(mode) + 1).mod(MODES.size)]
+
+    /** Changes session settings on the relay; [message] turns the updated session into a notice. */
+    private fun updateSession(fields: Map<String, Any?>, message: (SessionDetail) -> String?) = withClient { c ->
+        val id = s.session?.id ?: return@withClient
+        val detail = SessionDetail.from(c.call("update_session", mapOf("session" to id) + fields))
+        _state.update { it.copy(session = detail) }
+        message(detail)?.let(::notice)
     }
 
     private fun send(sessionId: String, text: String) = withClient { c ->
@@ -382,6 +434,30 @@ class AppController(private val app: Application) {
                 when (ev.optString("type")) {
                     "delta" -> updateReply { it.copy(content = it.content + ev.optString("text")) }
                     "thinking" -> updateReply { it.copy(thinking = it.thinking + ev.optString("text")) }
+                    "tool_call" -> {
+                        val call = ToolCall(ev.optString("call_id"), ev.optString("name"), ev.argumentsText("arguments"))
+                        updateReply { it.copy(toolCalls = it.toolCalls + call) }
+                        if (ev.optBoolean("needs_approval")) {
+                            _state.update { it.copy(pendingApproval = PendingApproval(sessionId, call.id, call.name, call.arguments)) }
+                        }
+                    }
+                    "tool_output" -> _state.update { st ->
+                        val id = ev.optString("call_id")
+                        st.copy(liveOutput = st.liveOutput + (id to st.liveOutput[id].orEmpty() + ev.optString("text")))
+                    }
+                    "tool_result" -> _state.update { st ->
+                        val id = ev.optString("call_id")
+                        val result = ChatMessage(
+                            "tool", ev.optString("output"),
+                            toolCallId = id, ok = ev.optBoolean("ok"), approval = ev.str("approval"),
+                        )
+                        st.copy(
+                            messages = st.messages + result,
+                            liveOutput = st.liveOutput - id,
+                            pendingApproval = st.pendingApproval?.takeIf { it.callId != id },
+                        )
+                    }
+                    "turn" -> _state.update { it.copy(messages = it.messages + ChatMessage("assistant", "", partial = true)) }
                     "end" -> {
                         val final = ev.optJSONObject("message")?.let(ChatMessage::from)
                         updateReply { final ?: it.copy(partial = false, status = ev.optString("status")) }
@@ -400,34 +476,62 @@ class AppController(private val app: Application) {
             throw e
         } finally {
             chatId = null
-            _state.update { it.copy(generatingSince = null) }
+            _state.update { it.copy(generatingSince = null, pendingApproval = null, liveOutput = emptyMap()) }
         }
         refreshSessions()
-        if (s.session?.title.isNullOrEmpty()) {
-            val detail = SessionDetail.from(c.call("get_session", mapOf("session" to sessionId)))
-            _state.update { it.copy(session = detail) }
+        // The server's copy is canonical (full tool outputs, final statuses, title).
+        val detail = SessionDetail.from(c.call("get_session", mapOf("session" to sessionId)))
+        if (s.session?.id == sessionId && chatId == null) {
+            _state.update { it.copy(session = detail, messages = detail.messages) }
         }
     }
 
+    /** Applies [f] to the reply being written: the last assistant message. */
     private fun updateReply(f: (ChatMessage) -> ChatMessage) = _state.update {
-        val last = it.messages.lastOrNull() ?: return@update it
-        if (last.isUser) it else it.copy(messages = it.messages.dropLast(1) + f(last))
+        val i = it.messages.indexOfLast { m -> m.role == "assistant" }
+        if (i < 0) it else it.copy(messages = it.messages.toMutableList().also { list -> list[i] = f(list[i]) })
     }
 
+    /** Stops the reply in the open session, whichever connection started it. */
     fun stop() {
-        val id = chatId ?: return
-        withClient { it.cancel(id) }
+        val id = s.session?.id ?: return
+        withClient { it.call("cancel", mapOf("session" to id)) }
+    }
+
+    /** decision: allow, allow_session or deny. [note] is passed to the model with a denial. */
+    fun approve(decision: String, note: String? = null) {
+        val pending = s.pendingApproval ?: return
+        approve(pending, decision, note)
+    }
+
+    fun approve(pending: PendingApproval, decision: String, note: String? = null) {
+        _state.update { it.copy(pendingApproval = it.pendingApproval?.takeIf { p -> p.callId != pending.callId }) }
+        withClient { c ->
+            try {
+                c.call("approve", mapOf("session" to pending.session, "call_id" to pending.callId,
+                                        "decision" to decision, "note" to note))
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                _state.update { it.copy(pendingApproval = pending) } // still pending: show it again
+                throw e
+            }
+        }
     }
 
     companion object {
         /** How long a swiped-away session can be restored; a bit longer than the snackbar. */
         const val UNDO_MS = 5_000L
 
+        val MODES = listOf("ask", "auto-read", "auto")
+
         val COMMANDS = listOf(
             "/new" to "start a new session",
             "/model" to "pick a model (or /model NAME)",
             "/sessions" to "browse and resume sessions",
             "/settings" to "connection and key",
+            "/agent" to "tools on/off (or /agent on|off)",
+            "/mode" to "approvals: ask · auto-read · auto",
+            "/cd" to "change working directory",
             "/help" to "list commands",
         )
     }

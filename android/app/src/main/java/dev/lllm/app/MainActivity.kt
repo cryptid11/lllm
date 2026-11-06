@@ -58,9 +58,19 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        vm.setVisible(true)
+    }
+
     override fun onResume() {
         super.onResume()
         vm.onResume()
+    }
+
+    override fun onStop() {
+        vm.setVisible(false)
+        super.onStop()
     }
 }
 
