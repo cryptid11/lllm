@@ -88,6 +88,11 @@ class CoreTest {
         assertEquals("Bash(echo one)", toolLabel("bash", """{"command": "echo one\necho two"}"""))
         assertEquals(78, toolLabel("bash", """{"command": "${"x".repeat(200)}"}""").length - "Bash()".length)
         assertEquals("mystery(…)", toolLabel("mystery", "not json"))
+        // Pi's tool names
+        assertEquals("Edit(a.kt)", toolLabel("edit", """{"path": "a.kt", "edits": [{"oldText": "x", "newText": "y"}]}"""))
+        assertEquals("List(.)", toolLabel("ls", "{}"))
+        assertEquals("Find(*.py)", toolLabel("find", """{"pattern": "*.py"}"""))
+        assertEquals("mcp__web__fetch(https://x.y)", toolLabel("mcp__web__fetch", """{"url": "https://x.y"}"""))
     }
 
     @Test

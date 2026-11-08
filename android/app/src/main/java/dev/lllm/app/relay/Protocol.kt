@@ -79,14 +79,20 @@ fun toolLabel(name: String, arguments: String): String {
         val line = args.optString(key).lineSequence().firstOrNull().orEmpty()
         return if (line.length > 80) line.take(77) + "…" else line
     }
+    // Tool names of both engines: the builtin one (read_file...) and Pi (read, ls, find...).
     return when (name) {
         "bash" -> "Bash(${arg("command")})"
-        "read_file" -> "Read(${arg("path")})"
-        "write_file" -> "Write(${arg("path")})"
-        "edit_file" -> "Edit(${arg("path")})"
-        "list_dir" -> "List(${arg("path").ifEmpty { "." }})"
+        "read_file", "read" -> "Read(${arg("path")})"
+        "write_file", "write" -> "Write(${arg("path")})"
+        "edit_file", "edit" -> "Edit(${arg("path")})"
+        "list_dir", "ls" -> "List(${arg("path").ifEmpty { "." }})"
         "grep" -> "Grep(${arg("pattern")})"
-        else -> "$name(…)"
+        "find" -> "Find(${arg("pattern")})"
+        else -> {
+            // Other tools (MCP, extensions): show the first text argument.
+            val first = args.keys().asSequence().map { args.opt(it) }.filterIsInstance<String>().firstOrNull()
+            "$name(${first?.lineSequence()?.firstOrNull()?.take(60) ?: "…"})"
+        }
     }
 }
 
@@ -146,6 +152,8 @@ data class SessionDetail(
     val permissionMode: String = "auto-read",
     val cwd: String = "",
     val pendingApproval: PendingApproval? = null,
+    /** "pi" or "builtin": which agent loop runs this session on the relay. */
+    val engine: String = "builtin",
 ) {
     companion object {
         fun from(data: JSONObject): SessionDetail {
@@ -160,6 +168,7 @@ data class SessionDetail(
                 agent = s.optBoolean("agent"),
                 permissionMode = s.str("permission_mode") ?: "auto-read",
                 cwd = s.str("cwd") ?: "",
+                engine = s.str("engine") ?: "builtin",
                 pendingApproval = s.optJSONObject("pending_approval")?.let {
                     PendingApproval(s.getString("id"), it.optString("call_id"), it.optString("name"), it.argumentsText("arguments"))
                 },

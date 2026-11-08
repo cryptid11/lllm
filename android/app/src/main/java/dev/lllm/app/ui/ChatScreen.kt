@@ -206,7 +206,8 @@ private fun Welcome(state: UiState) {
         Text("  ${session.provider} · ${session.model}", color = Palette.Dim, fontSize = 12.sp)
         Text("  ${state.profile?.label}", color = Palette.Dim, fontSize = 12.sp)
         if (session.agent) {
-            Text("  agent · ${session.permissionMode} · ${session.cwd}", color = Palette.Dim, fontSize = 12.sp)
+            val engine = if (session.engine == "pi") "pi agent" else "agent"
+            Text("  $engine · ${session.permissionMode} · ${session.cwd}", color = Palette.Dim, fontSize = 12.sp)
         } else {
             Text("  chat only (/agent to give it tools)", color = Palette.Dim, fontSize = 12.sp)
         }
@@ -318,11 +319,16 @@ private fun ApprovalCard(
     onNote: (String) -> Unit,
 ) {
     val args = remember(pending.arguments) { runCatching { JSONObject(pending.arguments) }.getOrDefault(JSONObject()) }
+    fun diff(old: String, new: String) = "- " + old.replace("\n", "\n- ") + "\n+ " + new.replace("\n", "\n+ ")
     val detail = when (pending.name) {
         "bash" -> args.optString("command")
-        "write_file" -> args.optString("content").let { if (it.length > 1500) it.take(1500) + "\n…" else it }
-        "edit_file" -> "- " + args.optString("old_string").replace("\n", "\n- ") +
-            "\n+ " + args.optString("new_string").replace("\n", "\n+ ")
+        "write_file", "write" -> args.optString("content").let { if (it.length > 1500) it.take(1500) + "\n…" else it }
+        "edit_file" -> diff(args.optString("old_string"), args.optString("new_string"))
+        // Pi's edit: a list of {oldText, newText} replacements.
+        "edit" -> args.optJSONArray("edits")?.let { edits ->
+            (0 until edits.length()).mapNotNull { edits.optJSONObject(it) }
+                .joinToString("\n⋯\n") { diff(it.optString("oldText"), it.optString("newText")) }
+        } ?: args.toString(2)
         else -> args.toString(2)
     }
     Column(

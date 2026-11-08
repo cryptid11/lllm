@@ -86,6 +86,11 @@ user: `bash`, `read_file`, `write_file`, `edit_file`, `list_dir`, `grep`. One `c
 model response → tool calls → results → next model response (a `turn` event), until the model
 answers without calling tools or `agent.max_steps` is reached.
 
+Session field `engine`: `builtin` (the relay's own tools, described here) or `pi` (the relay runs
+[Pi](https://pi.dev) in RPC mode per message and translates its events into the same messages and
+events; Pi's tool names are `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, and the `cwd` is
+fixed after the first message).
+
 Session fields: `agent`, `permission_mode` (`ask` approves everything; `auto-read`, the default,
 auto-runs `read_file`/`list_dir`/`grep`; `auto` never asks), `cwd` (updated when bash `cd`s),
 `allowed_tools` (tools allowed for the rest of the session via `allow_session`). All are settable

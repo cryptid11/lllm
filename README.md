@@ -72,6 +72,32 @@ In a chat: type `/` for commands (`/new`, `/model`, `/sessions`, `/settings`, `/
 tap the model name to switch models, and tap ✕ to interrupt a reply. If the connection drops
 mid-reply, the server finishes and saves it, and the app picks it up when it reconnects.
 
+### Agent engine: Pi
+
+With `"engine": "pi"` in `config.json`, new sessions run on [Pi](https://pi.dev) instead of the
+relay's own tool loop. For each message the relay starts `pi --mode rpc` on that session's Pi
+session (so Pi keeps the full context, with compaction), mirrors its events to the app, and answers
+Pi's tool approvals through a small extension it writes to `~/.local/share/lllm/pi/`.
+Approvals, Stop, reconnects and notifications work exactly as below.
+
+Setup (Pi needs Node 22.19+; here installed next to the system Node, without sudo):
+
+```bash
+mkdir -p ~/.local/node22 && curl -fsSL https://nodejs.org/dist/v22.23.4/node-v22.23.4-linux-arm64.tar.xz \
+  | tar -xJ -C ~/.local/node22 --strip-components=1
+PATH=~/.local/node22/bin:$PATH npm install -g --prefix ~/.local/node22 --ignore-scripts @earendil-works/pi-coding-agent
+```
+
+```json
+"engine": "pi",
+"pi": {"command": ["~/.local/node22/bin/node", "~/.local/node22/bin/pi"],
+       "session_dir": "~/.local/share/lllm/pi-sessions", "args": []}
+```
+
+The provider's key is handed to Pi (`OPENROUTER_API_KEY` for OpenRouter); set `pi_provider` /
+`pi_key_env` on a provider if the guess is wrong. A Pi session keeps the folder it started in.
+Existing sessions keep the engine they were created with.
+
 ### Agent mode
 
 New sessions are agents: the model can run commands and read, write and edit files on the server,

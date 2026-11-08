@@ -18,6 +18,7 @@ import http.client
 import json
 import os
 import platform
+import queue
 import re
 import shlex
 import signal
@@ -52,6 +53,17 @@ DEFAULT_CONFIG = {
     "request_timeout": 900,
     # Seconds between saves of a reply that is still being generated.
     "partial_save_interval": 2.0,
+    # Agent engine for new sessions: "builtin" (this file's tool loop) or "pi" (https://pi.dev).
+    "engine": "builtin",
+    "pi": {
+        # How to start Pi (here: Node 22 installed under ~/.local/node22).
+        "command": ["~/.local/node22/bin/node", "~/.local/node22/bin/pi"],
+        "args": [],
+        "session_dir": "~/.local/share/lllm/pi-sessions",
+        "append_system_prompt": "The user reads your replies on a phone: keep them short.",
+        # Seconds to wait for Pi to stop after an abort before killing it.
+        "abort_grace": 10,
+    },
     "agent": {
         # New sessions get tools (shell, files) on this machine.
         "enabled": True,
@@ -93,6 +105,7 @@ def load_config(path: Path = CONFIG_PATH) -> dict:
             raise RelayError(f"{path}: config must be a JSON object")
         cfg.update(user)
         cfg["agent"] = {**DEFAULT_CONFIG["agent"], **(user.get("agent") or {})}
+        cfg["pi"] = {**DEFAULT_CONFIG["pi"], **(user.get("pi") or {})}
     return cfg
 
 
@@ -379,7 +392,7 @@ PROVIDER_TYPES = {"ollama": OllamaProvider, "openai": OpenAIProvider}
 
 # --------------------------------------------------------------------------- agent tools
 
-READ_ONLY_TOOLS = {"read_file", "list_dir", "grep"}
+READ_ONLY_TOOLS = {"read_file", "list_dir", "grep", "read", "find", "ls"}  # builtin and Pi names
 PERMISSION_MODES = ("ask", "auto-read", "auto")
 APPROVAL_DECISIONS = ("allow", "allow_session", "deny")
 MAX_TOOL_OUTPUT = 30_000  # characters of a tool result sent to the model
@@ -690,6 +703,72 @@ class StopCheck:
         return False
 
 
+# --------------------------------------------------------------------------- Pi engine
+
+# Pi extension that asks the relay about every tool call. The relay applies the session's
+# permission mode and answers at once, or after the user decides on their phone.
+# Request: an `input` dialog whose title is JSON. Reply: "allow" or "deny:<reason for the model>".
+PI_EXTENSION = """// Written by lllm-relay; changes are overwritten.
+export default function (pi: any) {
+  pi.on("tool_call", async (event: any, ctx: any) => {
+    const request = JSON.stringify({ lllm: "approve", id: event.toolCallId, tool: event.toolName, input: event.input });
+    const answer = await ctx.ui.input(request, "");
+    if (answer === "allow") return;
+    const reason = typeof answer === "string" && answer.startsWith("deny:") ? answer.slice(5).trim() : "";
+    return { block: true, reason: reason || "The user did not approve this tool call." };
+  });
+}
+"""
+
+# Environment variable Pi reads each provider's key from.
+PI_KEY_ENV = {"openrouter": "OPENROUTER_API_KEY", "openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY",
+              "google": "GEMINI_API_KEY", "groq": "GROQ_API_KEY", "mistral": "MISTRAL_API_KEY", "xai": "XAI_API_KEY"}
+
+
+def pi_extension_path():
+    """Writes the approval extension next to the sessions (keeps the relay a single file)."""
+    path = Path("~/.local/share/lllm/pi/lllm-approval.ts").expanduser()
+    if not path.exists() or path.read_text(encoding="utf-8") != PI_EXTENSION:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(PI_EXTENSION, encoding="utf-8")
+    return path
+
+
+def pi_provider_name(provider):
+    """Pi's name for one of our providers: explicit `pi_provider`, else guessed from the backend."""
+    if provider.cfg.get("pi_provider"):
+        return provider.cfg["pi_provider"]
+    if provider.cfg.get("type") == "ollama":
+        return "ollama"
+    if "openrouter.ai" in provider.base:
+        return "openrouter"
+    return None
+
+
+def _pi_text(content):
+    if isinstance(content, str):
+        return content
+    return "".join(b.get("text", "") for b in content or [] if isinstance(b, dict) and b.get("type") == "text")
+
+
+def pi_assistant(msg):
+    """(text, thinking, tool_calls in OpenAI shape) from a Pi assistant message."""
+    text, thinking, calls = [], [], []
+    content = msg.get("content")
+    if isinstance(content, str):
+        text.append(content)
+    for block in content if isinstance(content, list) else []:
+        kind = block.get("type")
+        if kind == "text":
+            text.append(block.get("text", ""))
+        elif kind == "thinking":
+            thinking.append(block.get("thinking", ""))
+        elif kind == "toolCall":
+            calls.append({"id": block.get("id"), "type": "function",
+                          "function": {"name": block.get("name"), "arguments": json.dumps(block.get("arguments") or {})}})
+    return "".join(text), "".join(thinking), calls
+
+
 # --------------------------------------------------------------------------- sessions
 
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -725,6 +804,7 @@ def summarize(session) -> dict:
         "generating": is_generating(session),
         "archived": bool(session.get("archived")),
         "agent": bool(session.get("agent")),
+        "engine": session.get("engine") or "builtin",
     }
 
 
@@ -846,6 +926,7 @@ class Engine:
             "protocol": PROTOCOL_VERSION,
             "host": socket.gethostname(),
             "default_provider": self.provider().name,
+            "engine": self.cfg.get("engine") or "builtin",
             "providers": {n: {"type": p.cfg["type"], "default_model": p.cfg.get("default_model") or None}
                           for n, p in self.providers.items()},
         }
@@ -857,6 +938,10 @@ class Engine:
     @property
     def agent_cfg(self):
         return self.cfg.get("agent") or DEFAULT_CONFIG["agent"]
+
+    @property
+    def pi_cfg(self):
+        return {**DEFAULT_CONFIG["pi"], **(self.cfg.get("pi") or {})}
 
     def new_session(self, title=None, provider=None, model=None, system=None, options=None, agent=None):
         p = self.provider(provider)
@@ -873,6 +958,7 @@ class Engine:
             "agent": bool(self.agent_cfg.get("enabled")) if agent is None else bool(agent),
             "permission_mode": self.agent_cfg.get("permission_mode", "auto-read"),
             "cwd": self._default_cwd(),
+            "engine": self.cfg.get("engine") or "builtin",
             "messages": [],
         }
         with self.store.lock:
@@ -889,6 +975,8 @@ class Engine:
         with self.store.lock:
             session = self.store.load(sid)
             for key, value in changes.items():
+                if key == "_internal":
+                    continue
                 if key not in allowed:
                     raise RelayError(f"cannot change {key!r}")
                 if key == "provider":
@@ -904,6 +992,8 @@ class Engine:
                 if key == "cwd":
                     if not isinstance(value, str):
                         raise RelayError("cwd must be a string")
+                    if session.get("engine") == "pi" and session.get("messages") and not changes.get("_internal"):
+                        raise RelayError("a Pi session keeps the folder it started in; start a new session to work elsewhere")
                     base = session.get("cwd") or self._default_cwd()
                     value = os.path.normpath(os.path.join(base, os.path.expanduser(value)))
                     if not os.path.isdir(value):
@@ -984,6 +1074,11 @@ class Engine:
 
         emit({"type": "start", "session": sid, "index": index, "model": model, "provider": provider.name})
         stop = StopCheck(self.store, sid, token)
+        if session.get("engine") == "pi":
+            status, error, index = self._pi_chat(sid, index, text, provider, model, emit, stop)
+            message = self._finish(sid, index, status, error)
+            emit({"type": "end", "status": status, "error": error, "index": index, "message": message})
+            return message
         max_steps = int(self.agent_cfg.get("max_steps", 40))
         steps = 0
         while True:
@@ -1055,8 +1150,8 @@ class Engine:
                           status=status, error=error, stats=stats, tool_calls=tool_calls)
         return status, error, tool_calls
 
-    def _needs_approval(self, session, name):
-        if name not in TOOL_NAMES:
+    def _needs_approval(self, session, name, known=TOOL_NAMES):
+        if known is not None and name not in known:
             return False  # fails without running anything
         mode = session.get("permission_mode") or self.agent_cfg.get("permission_mode", "auto-read")
         if mode == "auto" or (mode == "auto-read" and name in READ_ONLY_TOOLS):
@@ -1103,7 +1198,7 @@ class Engine:
                                             {"type": "tool_output", "call_id": cid, "text": text}))
                     ok, output = runner.run(name, args)
                     if runner.cwd != cwd:
-                        self.update_session(sid, cwd=runner.cwd)
+                        self.update_session(sid, cwd=runner.cwd, _internal=True)
                     if stop():
                         status = "cancelled"
             self._add_tool_result(sid, cid, name, ok, output, approval)
@@ -1177,6 +1272,253 @@ class Engine:
             self.store.save(session, touch=False)
         return True
 
+    # ------------------------------------------------------------------ Pi
+
+    def _pi_command(self, session, provider, model):
+        pc = self.pi_cfg
+        cmd = [os.path.expanduser(c) for c in pc["command"]]
+        session_dir = Path(pc["session_dir"]).expanduser()
+        session_dir.mkdir(parents=True, exist_ok=True)
+        cmd += ["--mode", "rpc", "--session-dir", str(session_dir), "--session-id", session["id"],
+                "-e", str(pi_extension_path())]
+        name = pi_provider_name(provider)
+        if name:
+            cmd += ["--provider", name]
+        cmd += ["--model", model]
+        if pc.get("append_system_prompt"):
+            cmd += ["--append-system-prompt", pc["append_system_prompt"]]
+        if not session.get("agent"):
+            cmd.append("--no-tools")
+        return cmd + [str(a) for a in pc.get("args") or []]
+
+    def _pi_env(self, provider):
+        env = dict(os.environ)
+        node_dir = os.path.dirname(os.path.expanduser(self.pi_cfg["command"][0]))
+        if node_dir:
+            env["PATH"] = node_dir + os.pathsep + env.get("PATH", "")  # tools Pi starts get the same Node
+        name = pi_provider_name(provider)
+        var = provider.cfg.get("pi_key_env") or PI_KEY_ENV.get(name)
+        if var and isinstance(provider, OpenAIProvider):
+            key = provider._api_key()
+            if key:
+                env[var] = key
+        return env
+
+    def _pi_chat(self, sid, index, text, provider, model, emit, stop):
+        """Run one message through `pi --mode rpc`; mirror its events into the session and emit().
+
+        Returns (status, error, index of the last assistant message).
+        """
+        with self.store.lock:
+            session = self.store.load(sid)
+        cwd = session.get("cwd") or self._default_cwd()
+        if not os.path.isdir(cwd):
+            cwd = os.path.expanduser("~")
+        try:
+            proc = subprocess.Popen(self._pi_command(session, provider, model), cwd=cwd, env=self._pi_env(provider),
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    start_new_session=True)
+        except OSError as e:
+            return "error", f"cannot start Pi ({self.pi_cfg['command'][-1]}): {e}", index
+
+        events, stderr_tail = queue.Queue(), []
+
+        def read_stdout():
+            for raw in proc.stdout:  # binary lines split on LF only, as Pi's RPC framing requires
+                events.put(raw)
+            events.put(None)
+
+        def read_stderr():
+            for raw in proc.stderr:
+                stderr_tail.append(raw.decode("utf-8", "replace").rstrip())
+                del stderr_tail[:-20]
+
+        threading.Thread(target=read_stdout, daemon=True).start()
+        threading.Thread(target=read_stderr, daemon=True).start()
+        send_lock = threading.Lock()
+
+        def send(obj):
+            with send_lock:
+                try:
+                    proc.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
+                    proc.stdin.flush()
+                except (BrokenPipeError, OSError, ValueError):
+                    pass
+
+        send({"id": "prompt", "type": "prompt", "message": text})
+        status, error = "done", None
+        content, thinking = [], []
+        turns, announced, approvals, live = 0, set(), {}, {}
+        turn_started = first_token = None
+        last_save = time.monotonic()
+        interval = float(self.cfg.get("partial_save_interval", 2.0))
+        abort_deadline = None
+        settled = False
+        try:
+            while not settled:
+                if abort_deadline is None and stop():
+                    send({"id": "abort", "type": "abort"})
+                    status = "cancelled"
+                    abort_deadline = time.monotonic() + float(self.pi_cfg.get("abort_grace", 10))
+                if abort_deadline is not None and time.monotonic() > abort_deadline:
+                    break
+                try:
+                    raw = events.get(timeout=0.3)
+                except queue.Empty:
+                    continue
+                if raw is None:  # Pi exited
+                    if status == "done":
+                        status = "error"
+                        error = "Pi exited unexpectedly: " + (" | ".join(stderr_tail[-3:]) or "no output")
+                    break
+                try:
+                    ev = json.loads(raw)
+                except ValueError:
+                    continue
+                kind = ev.get("type")
+
+                if kind == "response" and ev.get("id") == "prompt" and ev.get("success") is False:
+                    status, error = "error", f"Pi rejected the message: {ev.get('error')}"
+                    break
+                elif kind == "turn_start":
+                    if turns:  # every turn after the first gets a new assistant message
+                        with self.store.lock:
+                            s = self.store.load(sid)
+                            s["messages"].append(self._placeholder(model))
+                            self.store.save(s)
+                            index = len(s["messages"]) - 1
+                        emit({"type": "turn", "index": index})
+                    turns += 1
+                    content, thinking = [], []
+                    turn_started, first_token = time.monotonic(), None
+                elif kind == "message_update":
+                    part = ev.get("assistantMessageEvent") or {}
+                    if part.get("type") in ("text_delta", "thinking_delta") and first_token is None:
+                        first_token = time.monotonic()
+                    if part.get("type") == "text_delta":
+                        content.append(part.get("delta", ""))
+                        emit({"type": "delta", "text": part.get("delta", "")})
+                    elif part.get("type") == "thinking_delta":
+                        thinking.append(part.get("delta", ""))
+                        emit({"type": "thinking", "text": part.get("delta", "")})
+                    if time.monotonic() - last_save >= interval:
+                        self._store_reply(sid, index, "".join(content), "".join(thinking))
+                        last_save = time.monotonic()
+                elif kind == "message_end" and (ev.get("message") or {}).get("role") == "assistant":
+                    msg = ev["message"]
+                    body, thoughts, calls = pi_assistant(msg)
+                    # The final message is authoritative, but keep what streamed if it left something out.
+                    body, thoughts = body or "".join(content), thoughts or "".join(thinking)
+                    usage = msg.get("usage") or {}
+                    stats = {"prompt_eval_count": usage.get("input"), "eval_count": usage.get("output"),
+                             "done_reason": msg.get("stopReason")}
+                    if (usage.get("cost") or {}).get("total") is not None:
+                        stats["cost_usd"] = usage["cost"]["total"]
+                    now = time.monotonic()
+                    if turn_started is not None:
+                        stats["wall_sec"] = round(now - turn_started, 2)
+                        if first_token is not None:
+                            stats["ttft_sec"] = round(first_token - turn_started, 2)
+                            if usage.get("output") and now > first_token:
+                                stats["tokens_per_sec"] = round(usage["output"] / (now - first_token), 2)
+                    turn_status, turn_error = "done", None
+                    if msg.get("stopReason") == "error":
+                        turn_status, turn_error = "error", msg.get("errorMessage") or "model error"
+                    elif msg.get("stopReason") == "aborted":
+                        turn_status = "cancelled"
+                    self._store_reply(sid, index, body, thoughts, final=True, status=turn_status,
+                                      error=turn_error, stats=stats, tool_calls=calls)
+                    if turn_status == "error":
+                        status, error = "error", turn_error
+                    elif status == "error":
+                        status, error = "done", None  # Pi retried successfully
+                elif kind == "extension_ui_request":
+                    self._pi_ui_request(ev, sid, emit, stop, send, announced, approvals)
+                elif kind == "tool_execution_update":
+                    cid = ev.get("toolCallId")
+                    textnow = _pi_text((ev.get("partialResult") or {}).get("content"))
+                    before = live.get(cid, "")
+                    if textnow.startswith(before) and len(textnow) > len(before):
+                        emit({"type": "tool_output", "call_id": cid, "text": textnow[len(before):]})
+                        live[cid] = textnow
+                elif kind == "tool_execution_end":
+                    cid, name = ev.get("toolCallId"), ev.get("toolName")
+                    if (cid or "").count("/"):
+                        continue  # nested call made by another tool: not part of the transcript
+                    if cid not in announced:
+                        emit({"type": "tool_call", "call_id": cid, "name": name, "arguments": ev.get("args") or {},
+                              "needs_approval": False})
+                        announced.add(cid)
+                    output = _pi_text((ev.get("result") or {}).get("content"))
+                    ok = not ev.get("isError")
+                    approval = approvals.pop(cid, "auto")
+                    self._add_tool_result(sid, cid, name, ok, output, approval)
+                    emit({"type": "tool_result", "call_id": cid, "ok": ok, "approval": approval,
+                          "output": truncate(output, 4000)})
+                elif kind == "agent_settled":
+                    settled = True
+                    if ev.get("aborted"):
+                        status = "cancelled"
+                elif kind == "extension_error":
+                    stderr_tail.append(f"extension error: {ev.get('error')}")
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+            try:
+                proc.wait(10)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                proc.wait()
+        return status, error, index
+
+    def _pi_ui_request(self, ev, sid, emit, stop, send, announced, approvals):
+        """Answer Pi's dialogs: our extension's approval questions; anything else is cancelled."""
+        method, rid = ev.get("method"), ev.get("id")
+        if method not in ("select", "confirm", "input", "editor"):
+            return  # notify, setStatus, ...: nothing to answer
+        try:
+            request = json.loads(ev.get("title") or "") if method == "input" else None
+        except ValueError:
+            request = None
+        if not (isinstance(request, dict) and request.get("lllm") == "approve"):
+            send({"type": "extension_ui_response", "id": rid, "cancelled": True})
+            return
+        cid, name, args = request.get("id"), request.get("tool"), request.get("input") or {}
+        with self.store.lock:
+            session = self.store.load(sid)
+        needs = self._needs_approval(session, name, known=None)  # Pi's tools: everything is gated
+        emit({"type": "tool_call", "call_id": cid, "name": name, "arguments": args, "needs_approval": needs})
+        announced.add(cid)
+        decision, note = ("auto", None)
+        if needs:
+            decision, note = self._await_approval(sid, cid, name, args, stop)
+        approvals[cid] = decision
+        if decision in ("auto", "allow", "allow_session"):
+            value = "allow"
+        elif decision == "deny":
+            value = "deny:The user denied this tool call." + (f" They said: {note}" if note else "")
+        elif decision == "timeout":
+            value = "deny:Nobody approved this tool call in time, so it was not run."
+        else:
+            value = "deny:The user stopped the reply."
+        send({"type": "extension_ui_response", "id": rid, "value": value})
+
+    def delete_session(self, sid):
+        with self.store.lock:
+            self.store.delete(sid)
+        pi_dir = Path(self.pi_cfg["session_dir"]).expanduser()
+        if pi_dir.is_dir():
+            for f in pi_dir.rglob(f"*{sid}*.jsonl"):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+
     def _store_reply(self, sid, index, content, thinking, final=False, status=None, error=None, stats=None,
                      tool_calls=None):
         with self.store.lock:
@@ -1213,6 +1555,9 @@ class Engine:
             for key in ("generating", "cancel_requested", "pending_approval"):
                 session.pop(key, None)
             msg = session["messages"][index] if index < len(session["messages"]) else None
+            if msg is not None and msg.pop("partial", None) and status == "done":
+                status = "error"  # the engine ended without finishing this message
+                error = error or "the reply ended unexpectedly"
             if msg is not None and status != "done" and not msg.get("status"):
                 msg["status"] = status
                 if error:
@@ -1314,8 +1659,7 @@ class Server:
         return {"session": self.engine.update_session(req.get("session"), **changes)}
 
     def op_delete_session(self, rid, req):
-        with self.engine.store.lock:
-            self.engine.store.delete(req.get("session"))
+        self.engine.delete_session(req.get("session"))
         return {"deleted": req.get("session")}
 
     def op_chat(self, rid, req):
