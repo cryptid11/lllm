@@ -98,7 +98,7 @@ is opened: the phone still only uses SSH. `lllm-relay doctor` checks the connect
 - Questions from the agent appear as a card, or a notification when the app is in the background.
 - If the phone disconnects, OpenCode carries on; the app catches up when it reconnects.
 - Older Pi and built-in sessions keep their engine and appear on the `local_engine` side.
-- Tap the folder under the prompt to browse to or type another working folder.
+- The chat header shows the working folder; **edit folder** under the prompt changes it.
 
 ### Agent engine: Pi
 

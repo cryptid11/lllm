@@ -237,7 +237,11 @@ private fun EngineTabs(state: UiState, vm: AppController) {
 @Composable
 fun ConnLine(state: UiState) {
     val (dot, text) = when (val c = state.conn) {
-        is Conn.Up -> Palette.Ok to "${state.profile?.label} · ${c.hello.host}"
+        is Conn.Up -> {
+            // In a chat, the line also says which folder the agent works in.
+            val folder = state.session?.takeIf { state.screen == Screen.Chat && it.agent }?.cwd?.ifEmpty { null }
+            Palette.Ok to listOfNotNull(state.profile?.label, folder).joinToString(" · ")
+        }
         Conn.Connecting -> Palette.Accent to "connecting to ${state.profile?.label}…"
         is Conn.Down -> if (c.retrying) Palette.Accent to "reconnecting…" else Palette.Error to "disconnected"
         Conn.Idle -> Palette.Dim to "not configured"
@@ -245,7 +249,10 @@ fun ConnLine(state: UiState) {
     Row(verticalAlignment = Alignment.CenterVertically) {
         Box(Modifier.size(7.dp).background(dot, CircleShape))
         Spacer(Modifier.width(6.dp))
-        Text(text, color = Palette.Dim, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(
+            text, color = Palette.Dim, fontSize = 11.sp, lineHeight = 14.sp,
+            maxLines = if (state.screen == Screen.Chat) 2 else 1, overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 

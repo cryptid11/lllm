@@ -106,7 +106,7 @@ fun ChatScreen(state: UiState, vm: AppController) {
                     Column {
                         Text(
                             session?.title?.ifEmpty { null } ?: "New session",
-                            maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 16.sp,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 16.sp, lineHeight = 20.sp,
                         )
                         ConnLine(state)
                     }
@@ -116,6 +116,7 @@ fun ChatScreen(state: UiState, vm: AppController) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Sessions")
                     }
                 },
+                expandedHeight = 72.dp,
             )
         },
         bottomBar = {
@@ -716,8 +717,8 @@ private fun PromptBar(
         Row(Modifier.fillMaxWidth().padding(top = 4.dp, start = 4.dp)) {
             Text(
                 state.session?.model ?: "",
-                Modifier.clickable(enabled = state.connected) { onModel() },
-                color = Palette.Dim, fontSize = 11.sp,
+                Modifier.weight(1f, fill = false).clickable(enabled = state.connected) { onModel() },
+                color = Palette.Dim, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
             )
             val session = state.session
             if (session?.agent == true) {
@@ -726,25 +727,23 @@ private fun PromptBar(
                     "  ·  ${session.permissionMode}",
                     Modifier.clickable(enabled = state.connected) { onMode() },
                     color = if (session.permissionMode == "auto") Palette.Error else Palette.Accent,
-                    fontSize = 11.sp,
+                    fontSize = 11.sp, maxLines = 1,
+                )
+            }
+        }
+        Row(Modifier.fillMaxWidth().padding(top = 5.dp, start = 4.dp, bottom = 2.dp)) {
+            val session = state.session
+            // A Pi session cannot leave the folder its conversation started in.
+            if (session?.agent == true && session.cwd.isNotEmpty() && !(session.engine == "pi" && state.messages.isNotEmpty())) {
+                val enabled = state.connected && !state.generating
+                Text(
+                    "edit folder",
+                    Modifier.clickable(enabled = enabled) { onFolder() },
+                    color = if (enabled) Palette.Accent else Palette.Dim, fontSize = 11.sp, maxLines = 1,
                 )
             }
             Spacer(Modifier.weight(1f))
-            Text("/ for commands", color = Palette.Dim, fontSize = 11.sp)
-        }
-        val session = state.session
-        if (session?.agent == true && session.cwd.isNotEmpty()) {
-            // A Pi session cannot leave the folder its conversation started in.
-            val locked = session.engine == "pi" && state.messages.isNotEmpty()
-            val shown = if (session.cwd.length > 44) "…" + session.cwd.takeLast(43) else session.cwd
-            Text(
-                if (locked) "folder  $shown" else "folder  $shown  ✎",
-                Modifier
-                    .fillMaxWidth()
-                    .clickable(enabled = state.connected && !state.generating && !locked) { onFolder() }
-                    .padding(start = 4.dp, top = 5.dp, bottom = 2.dp),
-                color = if (locked) Palette.Dim else Palette.Accent, fontSize = 11.sp, maxLines = 1,
-            )
+            Text("/ for commands", color = Palette.Dim, fontSize = 11.sp, maxLines = 1)
         }
     }
 }
