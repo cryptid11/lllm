@@ -284,7 +284,7 @@ private fun SessionRow(s: SessionSummary, onOpen: () -> Unit, onLongPress: () ->
             Text(s.preview, color = Palette.Dim, fontSize = 13.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
         }
         Text(
-            "${s.model} · ${s.messageCount} msgs · ${ago(s.updated)}",
+            listOfNotNull(s.model, "${s.messageCount} msgs".takeIf { s.messageCount > 0 }, ago(s.updated)).joinToString(" · "),
             color = Color(0xFF6E6C68), fontSize = 11.sp,
         )
     }

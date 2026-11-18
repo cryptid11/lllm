@@ -83,6 +83,30 @@ class CoreTest {
     }
 
     @Test
+    fun parsesOpenCodeApprovalAndQuestion() {
+        val data = JSONObject(
+            """{"session": {"id": "ses_1", "title": "t", "provider": "opencode", "model": "opencode/m",
+               "engine": "opencode", "agent": true, "generating": true, "messages": [],
+               "pending_approval": {"call_id": "c1", "name": "shell", "arguments": {"command": "git push"},
+                                    "save": ["git push *"]},
+               "pending_form": {"id": "frm_1", "sessionID": "ses_child", "title": "Questions",
+                 "metadata": {"kind": "question"}, "fields": [
+                   {"key": "q0", "type": "string", "title": "Color", "custom": true,
+                    "options": [{"value": "Red", "label": "Red", "description": "warm"}]},
+                   {"key": "gone", "type": "string", "hidden": true}]}}}"""
+        )
+        val s = SessionDetail.from(data)
+        assertEquals("Shell(git push)", s.pendingApproval?.label)
+        assertEquals(listOf("git push *"), s.pendingApproval?.save)
+        val form = s.pendingForm!!
+        assertEquals("ses_child", form.session)
+        assertTrue(form.isQuestion)
+        assertEquals(listOf("q0"), form.fields.map { it.key })
+        assertEquals("warm", form.fields[0].options[0].description)
+        assertTrue(form.fields[0].custom)
+    }
+
+    @Test
     fun toolLabelsAreShortOneLiners() {
         assertEquals("Edit(src/a.py)", toolLabel("edit_file", """{"path": "src/a.py", "old_string": "x"}"""))
         assertEquals("Bash(echo one)", toolLabel("bash", """{"command": "echo one\necho two"}"""))
@@ -91,6 +115,7 @@ class CoreTest {
         // Pi's tool names
         assertEquals("Edit(a.kt)", toolLabel("edit", """{"path": "a.kt", "edits": [{"oldText": "x", "newText": "y"}]}"""))
         assertEquals("List(.)", toolLabel("ls", "{}"))
+        assertEquals("Glob(*.kt)", toolLabel("glob", """{"pattern": "*.kt"}"""))
         assertEquals("Find(*.py)", toolLabel("find", """{"pattern": "*.py"}"""))
         assertEquals("mcp__web__fetch(https://x.y)", toolLabel("mcp__web__fetch", """{"url": "https://x.y"}"""))
     }

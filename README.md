@@ -72,6 +72,29 @@ In a chat: type `/` for commands (`/new`, `/model`, `/sessions`, `/settings`, `/
 tap the model name to switch models, and tap ✕ to interrupt a reply. If the connection drops
 mid-reply, the server finishes and saves it, and the app picks it up when it reconnects.
 
+### Agent engine: OpenCode
+
+With `"engine": "opencode"` in `config.json`, the app works directly with the
+[OpenCode](https://opencode.ai) service on the server. Your OpenCode sessions show up in the app
+and sessions started on the phone show up in OpenCode, with its models, tools and agents.
+
+```json
+"engine": "opencode",
+"opencode": {"workdir": "~", "permission_mode": "auto-read"}
+```
+
+The relay finds the service with `opencode service status` (starting it if needed) and reads its
+password from `~/.config/opencode/service.json`, so the password stays on the server and no port
+is opened: the phone still only uses SSH. `lllm-relay doctor` checks the connection.
+
+- OpenCode allows every tool by default, so sessions created from the app get approval rules
+  (`workdir` and `permission_mode` above). Sessions started in the terminal keep theirs and show
+  as `auto` until you change them with `/mode`.
+- **Always** on an approval saves OpenCode's rule for the whole project; the card shows which one.
+- Questions from the agent appear as a card, or a notification when the app is in the background.
+- If the phone disconnects, OpenCode carries on; the app catches up when it reconnects.
+- Older Pi and built-in sessions stay in the list and keep their engine.
+
 ### Agent engine: Pi
 
 With `"engine": "pi"` in `config.json`, new sessions run on [Pi](https://pi.dev) instead of the

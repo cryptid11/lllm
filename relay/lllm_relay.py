@@ -11,6 +11,7 @@ Backends are pluggable: native Ollama, or anything OpenAI-compatible
 from __future__ import annotations
 
 import argparse
+import base64
 import codecs
 import fnmatch
 import getpass
@@ -21,6 +22,7 @@ import platform
 import queue
 import re
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -32,7 +34,7 @@ import urllib.parse
 import uuid
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 PROTOCOL_VERSION = 2
 
 CONFIG_PATH = Path(os.environ.get("LLLM_CONFIG", "~/.config/lllm/config.json")).expanduser()
@@ -53,8 +55,19 @@ DEFAULT_CONFIG = {
     "request_timeout": 900,
     # Seconds between saves of a reply that is still being generated.
     "partial_save_interval": 2.0,
-    # Agent engine for new sessions: "builtin" (this file's tool loop) or "pi" (https://pi.dev).
+    # Agent engine for new sessions: "builtin" (this file's tool loop), "pi" (https://pi.dev)
+    # or "opencode" (the OpenCode service on this machine; its sessions appear in the app).
     "engine": "builtin",
+    "opencode": {
+        "command": "opencode",
+        # Empty: ask `opencode service status`, starting the service if needed.
+        "url": "",
+        "username": "opencode",
+        "password_file": "~/.config/opencode/service.json",
+        # Folder and approval mode of sessions created from the app.
+        "workdir": "~",
+        "permission_mode": "auto-read",
+    },
     "pi": {
         # How to start Pi (here: Node 22 installed under ~/.local/node22).
         "command": ["~/.local/node22/bin/node", "~/.local/node22/bin/pi"],
@@ -89,6 +102,10 @@ class BackendError(Exception):
     """The LLM backend failed or could not be reached."""
 
 
+class BackendUnreachable(BackendError):
+    """The backend could not be contacted at all."""
+
+
 class Cancelled(Exception):
     pass
 
@@ -106,6 +123,7 @@ def load_config(path: Path = CONFIG_PATH) -> dict:
         cfg.update(user)
         cfg["agent"] = {**DEFAULT_CONFIG["agent"], **(user.get("agent") or {})}
         cfg["pi"] = {**DEFAULT_CONFIG["pi"], **(user.get("pi") or {})}
+        cfg["opencode"] = {**DEFAULT_CONFIG["opencode"], **(user.get("opencode") or {})}
     return cfg
 
 
@@ -174,7 +192,7 @@ def http_request(method, url, body=None, headers=None, timeout=30.0, token=None)
         conn.close()
         if token is not None and token.cancelled:
             raise Cancelled() from None
-        raise BackendError(f"cannot reach backend at {u.scheme}://{u.netloc}: {e}") from None
+        raise BackendUnreachable(f"cannot reach backend at {u.scheme}://{u.netloc}: {e}") from None
     if resp.status >= 400:
         detail = _error_detail(resp.read().decode("utf-8", "replace"))
         conn.close()
@@ -886,6 +904,583 @@ class SessionStore:
         return out
 
 
+# --------------------------------------------------------------------------- OpenCode engine
+
+
+def _rule(action, effect, resource="*"):
+    return {"action": action, "resource": resource, "effect": effect}
+
+
+# OpenCode allows everything by default, so approvals need session rules (the last match wins).
+# These keep the guards of its default agents, which a catch-all rule would otherwise override.
+_OC_KEEP = [_rule("question", "allow"), _rule("browser", "deny"), _rule("skill", "deny", "browser")]
+OPENCODE_RULES = {
+    "auto": [],
+    "ask": [_rule("*", "ask"), *_OC_KEEP],
+    "auto-read": [_rule("*", "ask"), _rule("read", "allow"), _rule("glob", "allow"), _rule("grep", "allow"),
+                  _rule("read", "ask", "*.env"), _rule("read", "ask", "*.env.*"),
+                  _rule("read", "allow", "*.env.example"), *_OC_KEEP],
+}
+OPENCODE_REPLIES = {"allow": "once", "allow_session": "always", "deny": "reject"}
+OPENCODE_DECISIONS = {"once": "allow", "always": "allow_session", "reject": "deny"}
+
+
+def is_opencode_id(sid):
+    return isinstance(sid, str) and sid.startswith("ses")
+
+
+def _oc_text(content):
+    parts = []
+    for block in content or []:
+        if block.get("type") == "text":
+            parts.append(block.get("text", ""))
+        elif block.get("name") or block.get("uri"):
+            parts.append(f"[file {block.get('name') or block.get('uri')}]")
+    return "".join(parts)
+
+
+def _oc_model(ref):
+    return f"{ref['providerID']}/{ref['id']}" if ref else ""
+
+
+def _oc_tool_output(state):
+    text = _oc_text(state.get("content"))
+    if state.get("status") == "error":
+        message = (state.get("error") or {}).get("message", "")
+        text = message if not text or text in message else f"{message}\n{text}"
+    return truncate(text)
+
+
+def _oc_stats(m):
+    tokens, t = m.get("tokens") or {}, m.get("time") or {}
+    stats = {"prompt_eval_count": tokens.get("input"), "eval_count": tokens.get("output"),
+             "done_reason": m.get("finish"), "cost_usd": m.get("cost")}
+    if t.get("completed"):
+        stats["wall_sec"] = round((t["completed"] - t["created"]) / 1000, 2)
+    if t.get("firstToken"):
+        stats["ttft_sec"] = round((t["firstToken"] - t["created"]) / 1000, 2)
+        if tokens.get("output") and t.get("streamed", 0) > t["firstToken"]:
+            stats["tokens_per_sec"] = round(tokens["output"] / ((t["streamed"] - t["firstToken"]) / 1000), 2)
+    return {k: v for k, v in stats.items() if v is not None}
+
+
+def opencode_messages(raw, running=False):
+    """OpenCode's messages in the relay's transcript format (assistant + tool messages)."""
+    out, last = [], None
+    for m in raw:
+        kind, ts = m.get("type"), (m.get("time") or {}).get("created", 0) / 1000
+        if kind == "user":
+            out.append({"role": "user", "content": m.get("text", ""), "ts": ts})
+        elif kind == "assistant":
+            text, thinking, calls, results = [], [], [], []
+            for part in m.get("content") or []:
+                if part.get("type") == "text":
+                    text.append(part.get("text", ""))
+                elif part.get("type") == "reasoning":
+                    thinking.append(part.get("text", ""))
+                elif part.get("type") == "tool":
+                    state = part.get("state") or {}
+                    args = state.get("input")
+                    calls.append({"id": part.get("id"), "type": "function", "function": {
+                        "name": part.get("name"), "arguments": json.dumps(args if isinstance(args, dict) else {})}})
+                    if state.get("status") in ("completed", "error"):
+                        results.append({"role": "tool", "tool_call_id": part.get("id"), "name": part.get("name"),
+                                        "content": _oc_tool_output(state), "ok": state["status"] == "completed",
+                                        "approval": "auto", "ts": ts})
+            last = {"role": "assistant", "content": "".join(text), "ts": ts, "model": _oc_model(m.get("model")),
+                    "stats": _oc_stats(m)}
+            if thinking:
+                last["thinking"] = "".join(thinking)
+            if calls:
+                last["tool_calls"] = calls
+            if m.get("error"):
+                last["status"], last["error"] = "error", m["error"].get("message", "error")
+            if running and not (m.get("time") or {}).get("completed"):
+                last["partial"] = True
+            out.append(last)
+            out.extend(results)
+        elif kind == "shell":
+            cid = m.get("id")
+            last = {"role": "assistant", "content": "", "ts": ts, "tool_calls": [{
+                "id": cid, "type": "function",
+                "function": {"name": "shell", "arguments": json.dumps({"command": m.get("command", "")})}}]}
+            out.append(last)
+            if m.get("status") != "running":
+                out.append({"role": "tool", "tool_call_id": cid, "name": "shell", "approval": "auto", "ts": ts,
+                            "content": truncate((m.get("output") or {}).get("output", "")),
+                            "ok": m.get("exit") in (0, None)})
+        elif kind == "idle" and last is not None:
+            if m.get("outcome") == "interrupted":
+                last["status"] = "cancelled"
+                last.pop("error", None)
+            elif m.get("outcome") == "failed":
+                last["status"], last["error"] = "error", (m.get("error") or {}).get("message", "failed")
+    return out
+
+
+class OpenCode:
+    """Client for the OpenCode service on this machine, shaped like the relay's session API."""
+
+    STREAM_TIMEOUT = 20.0  # silent event streams are re-opened, so nothing can hang forever
+
+    def __init__(self, cfg):
+        self.cfg = {**DEFAULT_CONFIG["opencode"], **(cfg or {})}
+        self._url = (self.cfg.get("url") or "").rstrip("/") or None
+        self._parents = {}
+        self._default_model = None
+
+    # ------------------------------------------------------------------ transport
+
+    def _cli(self):
+        extra = [os.path.expanduser(p) for p in ("~/.npm-global/bin", "~/.local/bin", "~/.opencode/bin")]
+        path = os.pathsep.join([os.environ.get("PATH", ""), *extra])
+        exe = shutil.which(os.path.expanduser(self.cfg["command"]), path=path)
+        if not exe:
+            raise BackendError("OpenCode is not installed (command not found: opencode)")
+        return exe, {**os.environ, "PATH": path}
+
+    def base_url(self):
+        if self._url:
+            return self._url
+        exe, env = self._cli()
+        for attempt in range(2):
+            try:
+                r = subprocess.run([exe, "service", "status"], env=env, stdin=subprocess.DEVNULL,
+                                   capture_output=True, text=True, timeout=30)
+                found = re.search(r"https?://[^\s\"']+", r.stdout + r.stderr)
+                if r.returncode == 0 and found:
+                    self._url = found.group(0).rstrip("/")
+                    return self._url
+                if attempt == 0:
+                    subprocess.run([exe, "service", "start"], env=env, stdin=subprocess.DEVNULL,
+                                   capture_output=True, timeout=60)
+            except (OSError, subprocess.TimeoutExpired) as e:
+                raise BackendError(f"cannot query the OpenCode service: {e}") from None
+        raise BackendError("the OpenCode service is not running and could not be started")
+
+    def _headers(self):
+        try:
+            with open(os.path.expanduser(self.cfg["password_file"]), encoding="utf-8") as f:
+                password = json.load(f).get("password", "")
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as e:
+            raise BackendError(f"cannot read the OpenCode password file: {e}") from None
+        pair = f"{self.cfg['username']}:{password}".encode()
+        return {"Authorization": "Basic " + base64.b64encode(pair).decode()} if password else {}
+
+    def _connect(self, method, path, body, query, timeout, token=None):
+        qs = "?" + urllib.parse.urlencode(query) if query else ""
+        for attempt in range(2):
+            try:
+                return http_request(method, self.base_url() + path + qs, body, self._headers(), timeout, token)
+            except BackendUnreachable:
+                if attempt or self.cfg.get("url"):
+                    raise
+                self._url = None  # the service may have restarted on another port
+
+    def request(self, method, path, body=None, query=None, timeout=30):
+        conn, resp = self._connect(method, path, body, query, timeout)
+        try:
+            raw = resp.read()
+            return json.loads(raw) if raw else None
+        except (OSError, http.client.HTTPException, ValueError) as e:
+            raise BackendError(f"bad response from OpenCode: {e}") from None
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------ sessions
+
+    def _info(self, sid):
+        return self.request("GET", f"/api/session/{sid}")["data"]
+
+    def active(self):
+        return set(self.request("GET", "/api/session/active")["data"])
+
+    def default_model(self):
+        if self._default_model is None:
+            model = self.request("GET", "/api/model/default").get("data") or {}
+            self._default_model = _oc_model({"providerID": model["providerID"], "id": model["id"]}) if model else ""
+        return self._default_model
+
+    def _all_sessions(self, **query):
+        out, cursor = [], None
+        for _ in range(20):
+            q = {"limit": "200", "parentID": "null", **query, **({"cursor": cursor} if cursor else {})}
+            page = self.request("GET", "/api/session", query=q)
+            out += page.get("data") or []
+            cursor = (page.get("cursor") or {}).get("next")
+            if not cursor or not page.get("data"):
+                break
+        return out
+
+    def _summary(self, info, active):
+        t = info.get("time") or {}
+        return {
+            "id": info["id"], "title": info.get("title") or "", "created": t.get("created", 0) / 1000,
+            "updated": t.get("updated", 0) / 1000, "provider": "opencode",
+            "model": _oc_model(info.get("model")) or self.default_model(), "message_count": 0,
+            "preview": (info.get("location") or {}).get("directory", ""), "generating": info["id"] in active,
+            "archived": bool(t.get("archived")), "agent": True, "engine": "opencode",
+        }
+
+    def list_sessions(self):
+        active = self.active()
+        seen = {s["id"]: s for s in self._all_sessions() + self._all_sessions(archived="true")}
+        return [self._summary(s, active) for s in seen.values()]
+
+    def list_models(self):
+        models = self.request("GET", "/api/model")["data"]
+        return {"provider": "opencode",
+                "models": [_oc_model(m) for m in models if m.get("type", "chat") == "chat"]}
+
+    @staticmethod
+    def _mode(info):
+        rules = info.get("permissions") or []
+        return next((name for name, preset in OPENCODE_RULES.items() if preset == rules), "custom")
+
+    def _family(self, sid):
+        """The session and its sub-agent sessions: those can ask for approval too."""
+        out = [sid]
+        for child in self._all_sessions(parentID=sid):
+            self._parents[child["id"]] = sid
+            out.append(child["id"])
+        return out
+
+    def _belongs(self, root, sid):
+        for _ in range(8):
+            if sid == root:
+                return True
+            if not sid:
+                return False
+            if sid not in self._parents:
+                try:
+                    self._parents[sid] = self._info(sid).get("parentID")
+                except BackendError:
+                    return False
+            sid = self._parents[sid]
+        return False
+
+    def _permissions(self, sid):
+        return [p for member in self._family(sid)
+                for p in self.request("GET", f"/api/session/{member}/permission").get("data") or []]
+
+    def _forms(self, sid):
+        return [f for member in self._family(sid)
+                for f in self.request("GET", f"/api/session/{member}/form").get("data") or []]
+
+    @staticmethod
+    def _approval(req, tools):
+        cid = (req.get("source") or {}).get("id") or req["id"]
+        tool = tools.get(cid) or {}
+        resources = req.get("resources") or []
+        fallback = {"command": " && ".join(resources)} if req.get("action") == "shell" else {"resources": resources}
+        return {"call_id": cid, "name": tool.get("name") or req.get("action"),
+                "arguments": tool.get("input") or fallback, "save": req.get("save") or []}
+
+    def _messages_raw(self, sid):
+        out, cursor = [], None
+        for _ in range(100):
+            q = {"order": "asc", "limit": "200", **({"cursor": cursor} if cursor else {})}
+            page = self.request("GET", f"/api/session/{sid}/message", query=q)
+            data = page.get("data") or []
+            out += data
+            cursor = (page.get("cursor") or {}).get("next")
+            if not cursor or len(data) < 200:
+                break
+        return out
+
+    def get_session(self, sid, info=None):
+        info = info or self._info(sid)
+        running = sid in self.active()
+        raw = self._messages_raw(sid)
+        session = {
+            **self._summary(info, {sid} if running else ()),
+            "system": None, "options": {}, "permission_mode": self._mode(info),
+            "cwd": (info.get("location") or {}).get("directory", ""),
+            "messages": opencode_messages(raw, running),
+        }
+        if running:
+            tools = {}
+            for m in raw:
+                for part in m.get("content") or [] if m.get("type") == "assistant" else []:
+                    if part.get("type") == "tool":
+                        tools[part.get("id")] = {"name": part.get("name"), "input": (part.get("state") or {}).get("input")}
+            permissions = self._permissions(sid)
+            if permissions:
+                session["pending_approval"] = self._approval(permissions[0], tools)
+            forms = self._forms(sid)
+            if forms:
+                session["pending_form"] = forms[0]
+        return session
+
+    @staticmethod
+    def _model_ref(model, current=None):
+        if not isinstance(model, str) or not model:
+            raise RelayError("invalid model")
+        provider, sep, name = model.partition("/")
+        if sep:
+            return {"providerID": provider, "id": name}
+        if current:
+            return {"providerID": current["providerID"], "id": model}
+        raise RelayError("model must look like provider/name")
+
+    def new_session(self, title=None, model=None):
+        mode = self.cfg.get("permission_mode", "auto-read")
+        if mode not in OPENCODE_RULES:
+            raise RelayError(f"opencode.permission_mode must be one of {', '.join(OPENCODE_RULES)}")
+        workdir = os.path.expanduser(self.cfg.get("workdir") or "~")
+        body = {"location": {"directory": os.path.abspath(workdir)}, "permissions": OPENCODE_RULES[mode]}
+        if title:
+            body["title"] = title
+        if model:
+            body["model"] = self._model_ref(model)
+        info = self.request("POST", "/api/session", body)["data"]
+        return self.get_session(info["id"], info)
+
+    def update_session(self, sid, **changes):
+        info = self._info(sid)
+        patch = {}
+        for key, value in changes.items():
+            if key == "title":
+                if not isinstance(value, str):
+                    raise RelayError("title must be a string")
+                patch["title"] = " ".join(value.split())[:200]
+            elif key == "archived":
+                if not isinstance(value, bool):
+                    raise RelayError("archived must be true or false")
+                patch["archived"] = value
+            elif key == "permission_mode":
+                if value not in OPENCODE_RULES:
+                    raise RelayError(f"permission_mode must be one of {', '.join(OPENCODE_RULES)}")
+                patch["permissions"] = OPENCODE_RULES[value]
+            elif key == "model":
+                self.request("POST", f"/api/session/{sid}/model",
+                             {"model": self._model_ref(value, info.get("model"))})
+            elif key == "cwd":
+                if not isinstance(value, str):
+                    raise RelayError("cwd must be a string")
+                base = (info.get("location") or {}).get("directory") or os.path.expanduser("~")
+                target = os.path.normpath(os.path.join(base, os.path.expanduser(value)))
+                if not os.path.isdir(target):
+                    raise RelayError(f"not a directory: {target}")
+                self.request("POST", f"/api/session/{sid}/move", {"directory": target})
+            elif key == "agent":
+                if value is not True:
+                    raise RelayError("OpenCode sessions always have tools; use /mode to control approvals")
+            else:
+                raise RelayError(f"cannot change {key!r} on an OpenCode session")
+        if patch:
+            self.request("PATCH", f"/api/session/{sid}", patch)
+        return self.get_session(sid)
+
+    def delete_session(self, sid):
+        self.request("DELETE", f"/api/session/{sid}")
+
+    def request_cancel(self, sid):
+        return bool((self.request("POST", f"/api/session/{sid}/interrupt") or {}).get("interrupted"))
+
+    def approve(self, sid, call_id, decision, note=None):
+        if decision not in OPENCODE_REPLIES:
+            raise RelayError(f"decision must be one of {', '.join(OPENCODE_REPLIES)}")
+        for req in self._permissions(sid):
+            if call_id in (req["id"], (req.get("source") or {}).get("id")):
+                body = {"decision": OPENCODE_REPLIES[decision]}
+                if note and decision == "deny":
+                    body["message"] = str(note)[:2000]
+                self.request("POST", f"/api/session/{req['sessionID']}/permission/{req['id']}/reply", body)
+                return
+        raise RelayError("no pending approval for that tool call")
+
+    def reply_form(self, sid, form_id, answer):
+        if not isinstance(answer, dict):
+            raise RelayError("answer must be an object")
+        self.request("POST", f"/api/session/{sid}/form/{form_id}/reply", {"answer": answer})
+
+    def cancel_form(self, sid, form_id):
+        self.request("DELETE", f"/api/session/{sid}/form/{form_id}")
+
+    # ------------------------------------------------------------------ chat
+
+    def _watch_shell(self, shell_id, cid, cwd, emit, done):
+        """Streams a running command's output; OpenCode events only carry the shell's id."""
+        cursor, sent = 0, 0
+        while not done.is_set() and sent < MAX_LIVE_OUTPUT:
+            try:
+                out = self.request("GET", f"/api/shell/{shell_id}/output",
+                                   query={"location[directory]": cwd, "cursor": str(cursor)})["data"]
+            except (BackendError, KeyError, TypeError):
+                return
+            if out.get("output"):
+                sent += len(out["output"])
+                emit({"type": "tool_output", "call_id": cid, "text": out["output"]})
+            cursor = out.get("cursor", cursor)
+            done.wait(0.5)
+
+    def chat(self, sid, text, emit, token):
+        """Send a prompt and translate OpenCode's events until the run ends.
+
+        The work belongs to the OpenCode service: if this connection goes away it simply
+        carries on, and a reconnecting client reads the state back with get_session.
+        """
+        if not isinstance(text, str) or not text.strip():
+            raise RelayError("empty message")
+        info = self._info(sid)
+        if sid in self.active():
+            raise RelayError("this session is already generating a reply")
+        cwd = (info.get("location") or {}).get("directory", "")
+        # Subscribe first: events are not replayed, so none may fire before we listen.
+        conn, resp = self._connect("GET", "/api/event", None, None, self.STREAM_TIMEOUT, token)
+        try:
+            self.request("POST", f"/api/session/{sid}/prompt", {"text": text})
+        except BackendError:
+            conn.close()
+            raise
+        emit({"type": "start", "session": sid, "index": 0, "provider": "opencode",
+              "model": _oc_model(info.get("model")) or self.default_model()})
+
+        tools, announced, approvals, asked, permission_calls, forms, shells = {}, set(), {}, set(), {}, set(), {}
+        step, steps, started = None, 0, False
+        status, error, finished = "done", None, False
+        posted = time.monotonic()
+
+        def announce(cid, needs=False, save=None):
+            tool = tools.get(cid) or {}
+            if cid in announced and not needs:
+                return
+            announced.add(cid)
+            emit({"type": "tool_call", "call_id": cid, "name": tool.get("name", ""), "arguments": tool.get("input") or {},
+                  "needs_approval": needs, "save": save or []})
+
+        def ask_permission(req):
+            if req["id"] in asked:
+                return
+            asked.add(req["id"])
+            view = self._approval(req, tools)
+            permission_calls[req["id"]] = view["call_id"]
+            tools.setdefault(view["call_id"], {"name": view["name"], "input": view["arguments"]})
+            announce(view["call_id"], True, view["save"])
+
+        def show_form(form):
+            if form["id"] not in forms:
+                forms.add(form["id"])
+                emit({"type": "form", "form": form})
+
+        def sync():
+            for req in self._permissions(sid):
+                ask_permission(req)
+            for form in self._forms(sid):
+                show_form(form)
+
+        def handle(ev):
+            nonlocal step, steps, started, status, error, finished
+            kind, d = ev.get("type", ""), ev.get("data") or {}
+            owner = d.get("sessionID")
+            if kind == "permission.asked" and self._belongs(sid, owner):
+                ask_permission(d)
+            elif kind == "permission.replied" and d.get("requestID") in permission_calls:
+                cid = permission_calls[d["requestID"]]
+                approvals[cid] = OPENCODE_DECISIONS.get(d.get("reply"), "allow")
+                emit({"type": "approval_resolved", "call_id": cid})
+            elif kind == "form.created" and self._belongs(sid, (d.get("form") or {}).get("sessionID")):
+                show_form(d["form"])
+            elif kind in ("form.replied", "form.cancelled") and d.get("id") in forms:
+                emit({"type": "form_resolved", "form_id": d["id"]})
+            elif kind == "session.tool.input.started":
+                tools.setdefault(d.get("id"), {})["name"] = d.get("name")
+            elif kind == "session.tool.called":
+                tools.setdefault(d.get("id"), {})["input"] = d.get("input")
+            if owner != sid:
+                return
+            if kind == "session.execution.started":
+                started = True
+            elif kind == "session.step.started":
+                started = True
+                if d.get("assistantMessageID") != step:
+                    if step is not None:
+                        steps += 1
+                        emit({"type": "turn", "index": steps})
+                    step = d.get("assistantMessageID")
+            elif kind == "session.text.delta":
+                emit({"type": "delta", "text": d.get("delta", "")})
+            elif kind == "session.reasoning.delta":
+                emit({"type": "thinking", "text": d.get("delta", "")})
+            elif kind == "session.tool.called":
+                announce(d.get("id"))
+            elif kind == "session.tool.progress":
+                shell = (d.get("metadata") or {}).get("shellID")
+                if shell and d.get("id") not in shells:
+                    shells[d["id"]] = threading.Event()
+                    threading.Thread(target=self._watch_shell, daemon=True,
+                                     args=(shell, d["id"], cwd, emit, shells[d["id"]])).start()
+            elif kind in ("session.tool.success", "session.tool.failed"):
+                cid = d.get("id")
+                announce(cid)
+                if cid in shells:
+                    shells[cid].set()
+                ok = kind.endswith("success")
+                state = {"status": "completed" if ok else "error", "content": d.get("content"), "error": d.get("error")}
+                emit({"type": "tool_result", "call_id": cid, "ok": ok, "approval": approvals.get(cid, "auto"),
+                      "output": truncate(_oc_tool_output(state), 4000)})
+            elif kind == "session.execution.succeeded":
+                finished = True
+            elif kind == "session.execution.failed":
+                status, error, finished = "error", (d.get("error") or {}).get("message", "failed"), True
+            elif kind == "session.execution.interrupted":
+                status, finished = "cancelled", True
+
+        try:
+            while not finished:
+                try:
+                    for line in iter_lines(resp, token):
+                        if line.startswith("data:"):
+                            try:
+                                handle(json.loads(line[5:]))
+                            except ValueError:
+                                continue
+                            if finished:
+                                break
+                except BackendError:
+                    pass  # silence or a dropped stream: re-open below and catch up
+                conn.close()
+                if finished:
+                    break
+                if token.cancelled:
+                    raise Cancelled()
+                try:
+                    conn, resp = self._connect("GET", "/api/event", None, None, self.STREAM_TIMEOUT, token)
+                    running = sid in self.active()
+                    if running:
+                        started = True
+                        sync()
+                    elif started or time.monotonic() - posted > 15:
+                        raw = self._messages_raw(sid)
+                        idle = next((m for m in reversed(raw) if m.get("type") == "idle"), {})
+                        if idle.get("outcome") == "failed":
+                            status, error = "error", (idle.get("error") or {}).get("message", "failed")
+                        elif idle.get("outcome") == "interrupted":
+                            status = "cancelled"
+                        finished = True
+                except BackendError:
+                    if time.monotonic() - posted > 3600:
+                        raise
+                    token._event.wait(2)
+        except Cancelled:
+            return None  # this client left; OpenCode keeps working
+        except BackendError as e:
+            status, error = "error", str(e)
+        finally:
+            conn.close()
+            for done in shells.values():
+                done.set()
+
+        session = self.get_session(sid)
+        replies = [m for m in session["messages"] if m["role"] == "assistant"]
+        message = replies[-1] if replies else None
+        emit({"type": "end", "status": status, "error": error, "index": steps, "message": message})
+        return message
+
+
 # --------------------------------------------------------------------------- engine
 
 
@@ -903,6 +1498,41 @@ class Engine:
             self.providers[name] = cls(name, pcfg, timeout)
         if not self.providers:
             raise RelayError("no providers configured")
+        self._opencode = None
+
+    @property
+    def uses_opencode(self):
+        return self.cfg.get("engine") == "opencode"
+
+    @property
+    def opencode(self):
+        if self._opencode is None:
+            self._opencode = OpenCode(self.cfg.get("opencode"))
+        return self._opencode
+
+    def list_sessions(self):
+        """Saved sessions of every engine, newest activity first."""
+        result = {"sessions": self.store.list()}
+        if self.uses_opencode:
+            try:
+                result["sessions"] = result["sessions"] + self.opencode.list_sessions()
+            except BackendError as e:
+                result["warning"] = f"OpenCode: {e}"
+            result["sessions"].sort(key=lambda s: s.get("updated") or 0, reverse=True)
+        return result
+
+    def get_session(self, sid):
+        if is_opencode_id(sid):
+            return self.opencode.get_session(sid)
+        session = self.store.load(sid)
+        session["generating"] = is_generating(session)
+        return session
+
+    def reply_form(self, sid, form_id, answer):
+        self.opencode.reply_form(sid, form_id, answer)
+
+    def cancel_form(self, sid, form_id):
+        self.opencode.cancel_form(sid, form_id)
 
     def provider(self, name=None):
         name = name or self.cfg.get("default_provider") or next(iter(self.providers))
@@ -932,6 +1562,8 @@ class Engine:
         }
 
     def list_models(self, provider=None):
+        if provider == "opencode" or (provider is None and self.uses_opencode):
+            return self.opencode.list_models()
         p = self.provider(provider)
         return {"provider": p.name, "models": p.list_models()}
 
@@ -944,6 +1576,8 @@ class Engine:
         return {**DEFAULT_CONFIG["pi"], **(self.cfg.get("pi") or {})}
 
     def new_session(self, title=None, provider=None, model=None, system=None, options=None, agent=None):
+        if self.uses_opencode and provider in (None, "opencode"):
+            return self.opencode.new_session(title, model)
         p = self.provider(provider)
         now = time.time()
         session = {
@@ -958,7 +1592,7 @@ class Engine:
             "agent": bool(self.agent_cfg.get("enabled")) if agent is None else bool(agent),
             "permission_mode": self.agent_cfg.get("permission_mode", "auto-read"),
             "cwd": self._default_cwd(),
-            "engine": self.cfg.get("engine") or "builtin",
+            "engine": "builtin" if self.uses_opencode else (self.cfg.get("engine") or "builtin"),
             "messages": [],
         }
         with self.store.lock:
@@ -970,6 +1604,8 @@ class Engine:
         return cwd if os.path.isdir(cwd) else os.path.expanduser("~")
 
     def update_session(self, sid, **changes):
+        if is_opencode_id(sid):
+            return self.opencode.update_session(sid, **changes)
         allowed = {"title", "provider", "model", "system", "options", "archived",
                    "agent", "permission_mode", "cwd", "allowed_tools"}
         with self.store.lock:
@@ -1054,6 +1690,8 @@ class Engine:
         Everything is saved as it happens, and the work continues if the client disconnects,
         so a reconnecting client finds the result (or a pending approval) in the session.
         """
+        if is_opencode_id(sid):
+            return self.opencode.chat(sid, text, emit, token)
         if not isinstance(text, str) or not text.strip():
             raise RelayError("empty message")
         with self.store.lock:
@@ -1250,6 +1888,8 @@ class Engine:
             time.sleep(0.3)
 
     def approve(self, sid, call_id, decision, note=None):
+        if is_opencode_id(sid):
+            return self.opencode.approve(sid, call_id, decision, note)
         if decision not in APPROVAL_DECISIONS:
             raise RelayError(f"decision must be one of {', '.join(APPROVAL_DECISIONS)}")
         with self.store.lock:
@@ -1264,6 +1904,8 @@ class Engine:
 
     def request_cancel(self, sid):
         """Ask whichever process is generating in this session to stop. Returns False if idle."""
+        if is_opencode_id(sid):
+            return self.opencode.request_cancel(sid)
         with self.store.lock:
             session = self.store.load(sid)
             if not is_generating(session):
@@ -1509,6 +2151,8 @@ class Engine:
         send({"type": "extension_ui_response", "id": rid, "value": value})
 
     def delete_session(self, sid):
+        if is_opencode_id(sid):
+            return self.opencode.delete_session(sid)
         with self.store.lock:
             self.store.delete(sid)
         pi_dir = Path(self.pi_cfg["session_dir"]).expanduser()
@@ -1609,10 +2253,16 @@ class Server:
         # Client went away. Running generations keep going (non-daemon threads)
         # so their replies are saved; output is simply dropped.
         self.detached = True
+        # OpenCode runs on in its own service, so there is nothing to wait for.
+        with self.active_lock:
+            tokens = [t for t, sid in self.active.values() if is_opencode_id(sid)]
+        for t in tokens:
+            t.cancel()
 
     def dispatch(self, req):
         rid, op = req.get("id"), req.get("op")
-        if op in ("chat", "list_models", "new_session"):  # may block on the backend
+        remote = is_opencode_id(req.get("session")) or (op == "list_sessions" and self.engine.uses_opencode)
+        if op in ("chat", "list_models", "new_session") or remote:  # may block on the backend
             threading.Thread(target=self._run_op, args=(rid, op, req), daemon=(op != "chat")).start()
         else:
             self._run_op(rid, op, req)
@@ -1642,7 +2292,7 @@ class Server:
         return self.engine.list_models(req.get("provider"))
 
     def op_list_sessions(self, rid, req):
-        return {"sessions": self.engine.store.list()}
+        return self.engine.list_sessions()
 
     def op_new_session(self, rid, req):
         s = self.engine.new_session(req.get("title"), req.get("provider"), req.get("model"),
@@ -1650,9 +2300,7 @@ class Server:
         return {"session": s}
 
     def op_get_session(self, rid, req):
-        s = self.engine.store.load(req.get("session"))
-        s["generating"] = is_generating(s)
-        return {"session": s}
+        return {"session": self.engine.get_session(req.get("session"))}
 
     def op_update_session(self, rid, req):
         changes = {k: v for k, v in req.items() if k not in ("id", "op", "session")}
@@ -1677,6 +2325,8 @@ class Server:
     def op_cancel(self, rid, req):
         """Stop a reply: `target` (a chat request id on this connection) or `session` (from any connection)."""
         sid = req.get("session")
+        if is_opencode_id(sid):  # the run ends through OpenCode's events, which the stream reports
+            return {"cancelled": self.engine.request_cancel(sid)}
         with self.active_lock:
             tokens = [t for r, (t, s) in self.active.items() if r == req.get("target") or (sid and s == sid)]
         for t in tokens:
@@ -1686,6 +2336,14 @@ class Server:
 
     def op_approve(self, rid, req):
         self.engine.approve(req.get("session"), req.get("call_id"), req.get("decision"), req.get("note"))
+        return {"ok": True}
+
+    def op_form_reply(self, rid, req):
+        self.engine.reply_form(req.get("session"), req.get("form_id"), req.get("answer"))
+        return {"ok": True}
+
+    def op_form_cancel(self, rid, req):
+        self.engine.cancel_form(req.get("session"), req.get("form_id"))
         return {"ok": True}
 
 
@@ -1710,6 +2368,8 @@ DIM, RESET = ("\033[2m", "\033[0m") if sys.stdout.isatty() else ("", "")
 
 def _print_history(session):
     for m in session["messages"]:
+        if m["role"] == "tool":
+            continue
         who = "you" if m["role"] == "user" else session.get("model", "assistant")
         note = f" [{m['status']}]" if m.get("status") else ""
         print(f"{DIM}{who}{note}:{RESET} {m.get('content', '')}\n")
@@ -1717,10 +2377,11 @@ def _print_history(session):
 
 def cmd_chat(args):
     engine = Engine(load_config())
+    saved = engine.list_sessions()["sessions"] if args.last else []
     if args.session:
-        session = engine.store.load(args.session)
-    elif args.last and engine.store.list():
-        session = engine.store.load(engine.store.list()[0]["id"])
+        session = engine.get_session(args.session)
+    elif saved:
+        session = engine.get_session(saved[0]["id"])
     else:
         session = engine.new_session(provider=args.provider, model=args.model)
     if args.model and session["model"] != args.model:
@@ -1745,6 +2406,15 @@ def cmd_chat(args):
         elif ev["type"] == "tool_result":
             mark = "" if ev["ok"] else " (failed)"
             print(f"{DIM}  ⎿ {ev['approval']}{mark}{RESET}")
+        elif ev["type"] == "form":
+            form, answer = ev["form"], {}
+            for field in form.get("fields", []):
+                print(f"\n? {field.get('description') or field.get('title') or field['key']}")
+                for option in field.get("options") or []:
+                    print(f"    {option['value']}")
+                value = input("  answer: ").strip()
+                answer[field["key"]] = value.split(",") if field.get("type") == "multiselect" else value
+            engine.reply_form(form["sessionID"], form["id"], answer)
         elif ev["type"] == "end":
             stats = (ev.get("message") or {}).get("stats", {})
             tps = f" · {stats['tokens_per_sec']} tok/s" if stats.get("tokens_per_sec") else ""
@@ -1776,10 +2446,10 @@ def cmd_chat(args):
                 session = engine.new_session(provider=session["provider"], model=session["model"])
                 print(f"new session {session['id']}")
             elif cmd == "sessions":
-                for s in engine.store.list():
+                for s in engine.list_sessions()["sessions"]:
                     print(f"{s['id']}  {s['title'] or '(untitled)'}")
             elif cmd == "load" and arg:
-                session = engine.store.load(arg)
+                session = engine.get_session(arg)
                 _print_history(session)
             else:
                 print("/models  /model NAME  /new  /sessions  /load ID  /quit")
@@ -1807,10 +2477,14 @@ def cmd_chat(args):
 
 def cmd_sessions(args):
     engine = Engine(load_config())
-    for s in engine.store.list():
+    result = engine.list_sessions()
+    if result.get("warning"):
+        print(f"warning: {result['warning']}", file=sys.stderr)
+    for s in result["sessions"]:
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(s["updated"] or 0))
         flag = "  [archived]" if s["archived"] else ""
-        print(f"{s['id']}  {when}  {s['message_count']:>3} msgs  {s['model']}  {s['title'] or '(untitled)'}{flag}")
+        count = f"{s['message_count']:>3} msgs" if s["message_count"] else "        "
+        print(f"{s['id']}  {when}  {count}  {s['model']}  {s['title'] or '(untitled)'}{flag}")
     return 0
 
 
@@ -1823,6 +2497,15 @@ def cmd_doctor(args):
         return 1
     print(f"sessions: {engine.store.root} ({len(engine.store.list())} saved)")
     ok = True
+    if engine.uses_opencode:
+        try:
+            oc = engine.opencode
+            version = oc.request("GET", "/api/info").get("version")
+            print(f"opencode: OK, v{version} at {oc.base_url()}, {len(oc.list_sessions())} sessions, "
+                  f"{len(oc.list_models()['models'])} models, default {oc.default_model()}")
+        except BackendError as e:
+            ok = False
+            print(f"opencode: FAILED: {e}")
     for name, p in engine.providers.items():
         try:
             models = p.list_models()

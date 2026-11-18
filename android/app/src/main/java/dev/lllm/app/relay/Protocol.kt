@@ -65,8 +65,71 @@ data class ToolCall(val id: String, val name: String, val arguments: String) {
 }
 
 /** A tool call waiting for the user to allow or deny it. */
-data class PendingApproval(val session: String, val callId: String, val name: String, val arguments: String) {
+data class PendingApproval(
+    val session: String,
+    val callId: String,
+    val name: String,
+    val arguments: String,
+    /** OpenCode: the rules "Always" would save for the project, e.g. "git *". */
+    val save: List<String> = emptyList(),
+) {
     val label: String get() = toolLabel(name, arguments)
+}
+
+data class FormOption(val value: String, val label: String, val description: String)
+
+data class FormField(
+    val key: String,
+    /** string, number, integer, boolean, multiselect or external. */
+    val type: String,
+    val title: String,
+    val description: String,
+    val required: Boolean,
+    val options: List<FormOption>,
+    /** Free text is accepted besides the options. */
+    val custom: Boolean,
+    val placeholder: String,
+    val url: String,
+    val default: Any?,
+    /** Shown only when these (key, op, value) conditions hold. */
+    val conditions: List<Triple<String, String, Any?>>,
+)
+
+/** A question the agent is waiting on (OpenCode's forms). */
+data class PendingForm(
+    val session: String,
+    val id: String,
+    val title: String,
+    val isQuestion: Boolean,
+    val fields: List<FormField>,
+) {
+    companion object {
+        fun from(o: JSONObject) = PendingForm(
+            session = o.optString("sessionID"),
+            id = o.optString("id"),
+            title = o.optString("title"),
+            isQuestion = o.optJSONObject("metadata")?.optString("kind") == "question",
+            fields = o.optJSONArray("fields")?.objects().orEmpty().filterNot { it.optBoolean("hidden") }.map { f ->
+                FormField(
+                    key = f.optString("key"),
+                    type = f.optString("type", "string"),
+                    title = f.str("title") ?: "",
+                    description = f.str("description") ?: "",
+                    required = f.optBoolean("required"),
+                    options = f.optJSONArray("options")?.objects().orEmpty().map {
+                        FormOption(it.optString("value"), it.optString("label"), it.str("description") ?: "")
+                    },
+                    custom = f.optBoolean("custom"),
+                    placeholder = f.str("placeholder") ?: "",
+                    url = f.str("url") ?: "",
+                    default = if (f.isNull("default")) null else f.opt("default"),
+                    conditions = f.optJSONArray("when")?.objects().orEmpty().map {
+                        Triple(it.optString("key"), it.optString("op"), it.opt("value"))
+                    },
+                )
+            },
+        )
+    }
 }
 
 fun JSONObject.argumentsText(name: String): String =
@@ -82,12 +145,15 @@ fun toolLabel(name: String, arguments: String): String {
     // Tool names of both engines: the builtin one (read_file...) and Pi (read, ls, find...).
     return when (name) {
         "bash" -> "Bash(${arg("command")})"
+        "shell" -> "Shell(${arg("command")})"
         "read_file", "read" -> "Read(${arg("path")})"
         "write_file", "write" -> "Write(${arg("path")})"
         "edit_file", "edit" -> "Edit(${arg("path")})"
         "list_dir", "ls" -> "List(${arg("path").ifEmpty { "." }})"
         "grep" -> "Grep(${arg("pattern")})"
         "find" -> "Find(${arg("pattern")})"
+        "glob" -> "Glob(${arg("pattern")})"
+        "question" -> "Question"
         else -> {
             // Other tools (MCP, extensions): show the first text argument.
             val first = args.keys().asSequence().map { args.opt(it) }.filterIsInstance<String>().firstOrNull()
@@ -152,8 +218,9 @@ data class SessionDetail(
     val permissionMode: String = "auto-read",
     val cwd: String = "",
     val pendingApproval: PendingApproval? = null,
-    /** "pi" or "builtin": which agent loop runs this session on the relay. */
+    /** "opencode", "pi" or "builtin": which agent runs this session on the server. */
     val engine: String = "builtin",
+    val pendingForm: PendingForm? = null,
 ) {
     companion object {
         fun from(data: JSONObject): SessionDetail {
@@ -170,8 +237,12 @@ data class SessionDetail(
                 cwd = s.str("cwd") ?: "",
                 engine = s.str("engine") ?: "builtin",
                 pendingApproval = s.optJSONObject("pending_approval")?.let {
-                    PendingApproval(s.getString("id"), it.optString("call_id"), it.optString("name"), it.argumentsText("arguments"))
+                    PendingApproval(
+                        s.getString("id"), it.optString("call_id"), it.optString("name"),
+                        it.argumentsText("arguments"), it.optJSONArray("save")?.strings().orEmpty(),
+                    )
                 },
+                pendingForm = s.optJSONObject("pending_form")?.let(PendingForm::from),
             )
         }
     }

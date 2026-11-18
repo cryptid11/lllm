@@ -27,6 +27,8 @@ message that belongs to that request. Requests may be pipelined; replies can arr
 | `chat`           | `session`, `text`                                         | streamed events (below)          |
 | `cancel`         | `target` (a `chat` request id on this connection) or `session` (works from any connection) | `{cancelled: bool}` |
 | `approve`        | `session`, `call_id`, `decision` (`allow`, `allow_session`, `deny`), `note?` | `{ok}`        |
+| `form_reply`     | `session`, `form_id`, `answer` (object of field key → value); OpenCode only | `{ok}`         |
+| `form_cancel`    | `session`, `form_id`; OpenCode only                       | `{ok}`                           |
 
 ## Messages (relay → client)
 
@@ -42,6 +44,9 @@ message that belongs to that request. Requests may be pipelined; replies can arr
 | `tool_call`   | agent: `{id, call_id, name, arguments, needs_approval}`. If `needs_approval`, the call waits for `approve` |
 | `tool_output` | agent: `{id, call_id, text}`, live bash output                                   |
 | `tool_result` | agent: `{id, call_id, ok, approval, output}` (output truncated to 4000 chars; the session has it in full) |
+| `approval_resolved` | OpenCode: `{id, call_id}`, the approval was answered (possibly elsewhere) |
+| `form`        | OpenCode: `{id, form}`, the agent asks a question and waits for `form_reply`     |
+| `form_resolved` | OpenCode: `{id, form_id}`, the question was answered or cancelled              |
 | `turn`        | agent: `{id, index}`, the model starts another response after tool results     |
 | `end`      | chat: `{id, status, error, index, message}`. `status` is `done`, `cancelled` or `error` |
 
@@ -104,6 +109,16 @@ Stored messages follow the OpenAI shape: assistant messages may carry `tool_call
 While a call waits, the session has `pending_approval: {call_id, name, arguments, since}`. Since every
 connection is its own relay process, approvals and `cancel` by `session` go through the session file,
 so a client that reconnects can answer an approval (or stop the reply) started by an earlier connection.
+
+## OpenCode sessions
+
+Session ids starting with `ses` live in the OpenCode service, which the relay proxies: `engine` is
+`opencode`, `provider` is `opencode`, `model` is `provider/name`, and `list_sessions` merges them
+with local sessions (adding `warning` if OpenCode cannot be reached). `message_count` is 0 and
+`preview` is the session's folder. A `tool_call` may be sent twice for one call: first when the tool
+is called and again with `needs_approval` and `save` (the rules **Always** would remember) when it
+starts waiting. `get_session` reports waits as `pending_approval` and `pending_form` (OpenCode's form
+object). `permission_mode` can also read `custom` when the rules match no preset.
 
 ## Disconnects
 

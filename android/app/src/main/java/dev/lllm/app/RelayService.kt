@@ -39,6 +39,8 @@ class RelayService : Service() {
         val text: String,
         val generating: Boolean,
         val alert: PendingApproval? = null,
+        /** Title of a question from the agent, while the app is not on screen. */
+        val question: String? = null,
     )
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -65,6 +67,8 @@ class RelayService : Service() {
                 nm.notify(NOTIFICATION_ID, build(st))
                 val alert = st.alert
                 if (alert != null) nm.notify(APPROVAL_ID, buildApproval(alert)) else nm.cancel(APPROVAL_ID)
+                val question = st.question
+                if (question != null) nm.notify(QUESTION_ID, buildQuestion(question)) else nm.cancel(QUESTION_ID)
                 holdAwake(st.generating)
             }
         }
@@ -108,12 +112,14 @@ class RelayService : Service() {
             is Conn.Up -> Status(
                 "Connected to $who",
                 when {
+                    st.pendingForm != null -> "Waiting for your answer: ${st.pendingForm.title}"
                     st.pendingApproval != null -> "Waiting for approval: ${st.pendingApproval.label}"
                     st.generating -> "Generating a reply…"
                     else -> "Tap to open"
                 },
                 st.generating,
                 alert = st.pendingApproval?.takeIf { !st.appVisible },
+                question = st.pendingForm?.takeIf { !st.appVisible }?.title?.ifEmpty { "Question" },
             )
             Conn.Connecting -> Status("Connecting to $who…", "", false)
             is Conn.Down -> Status(if (c.retrying) "Reconnecting to $who…" else "Disconnected", c.reason, false)
@@ -143,6 +149,23 @@ class RelayService : Service() {
             .setSilent(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+            .build()
+    }
+
+    private fun buildQuestion(title: String): Notification {
+        val open = PendingIntent.getActivity(
+            this, 3,
+            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        return NotificationCompat.Builder(this, APPROVAL_CHANNEL)
+            .setSmallIcon(R.drawable.ic_stat_relay)
+            .setContentTitle("The agent has a question")
+            .setContentText(title)
+            .setContentIntent(open)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_REMINDER)
             .build()
     }
 
@@ -193,6 +216,7 @@ class RelayService : Service() {
         private const val NOTIFICATION_ID = 1
         private const val APPROVAL_CHANNEL = "approvals"
         private const val APPROVAL_ID = 2
+        private const val QUESTION_ID = 3
         private const val ACTION_DISCONNECT = "dev.lllm.app.DISCONNECT"
         private const val ACTION_APPROVE = "dev.lllm.app.APPROVE"
         private const val EXTRA_SESSION = "session"

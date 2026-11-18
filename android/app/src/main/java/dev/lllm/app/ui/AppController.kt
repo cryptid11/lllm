@@ -7,6 +7,7 @@ import dev.lllm.app.data.ProfileStore
 import dev.lllm.app.relay.ChatMessage
 import dev.lllm.app.relay.Hello
 import dev.lllm.app.relay.PendingApproval
+import dev.lllm.app.relay.PendingForm
 import dev.lllm.app.relay.RelayClient
 import dev.lllm.app.relay.RelayException
 import dev.lllm.app.relay.SessionDetail
@@ -55,6 +56,8 @@ data class UiState(
     val pendingDelete: Set<String> = emptySet(),
     /** A tool call in the open session waiting for Allow/Deny. */
     val pendingApproval: PendingApproval? = null,
+    /** A question from the agent waiting for an answer. */
+    val pendingForm: PendingForm? = null,
     /** Bash output streaming in, by tool call id, until its result arrives. */
     val liveOutput: Map<String, String> = emptyMap(),
     /** The app is on screen (otherwise approvals also raise a notification). */
@@ -231,8 +234,10 @@ class AppController(private val app: Application) {
     // ------------------------------------------------------------------ sessions
 
     fun refreshSessions() = withClient { c ->
-        val list = SessionSummary.listFrom(c.call("list_sessions"))
+        val data = c.call("list_sessions")
+        val list = SessionSummary.listFrom(data)
         _state.update { it.copy(sessions = list) }
+        data.str("warning")?.let(::notice)
     }
 
     fun setVisible(visible: Boolean) = _state.update { it.copy(appVisible = visible) }
@@ -240,7 +245,7 @@ class AppController(private val app: Application) {
     fun openSession(id: String) {
         _state.update {
             it.copy(screen = Screen.Chat, session = null, messages = emptyList(), generatingSince = null,
-                    pendingApproval = null, liveOutput = emptyMap())
+                    pendingApproval = null, pendingForm = null, liveOutput = emptyMap())
         }
         reloadSession(id)
     }
@@ -309,6 +314,7 @@ class AppController(private val app: Application) {
                 messages = detail.messages,
                 generatingSince = if (detail.generating) (it.generatingSince ?: System.currentTimeMillis()) else null,
                 pendingApproval = detail.pendingApproval,
+                pendingForm = detail.pendingForm,
                 liveOutput = emptyMap(),
             )
         }
@@ -329,6 +335,7 @@ class AppController(private val app: Application) {
                         messages = detail.messages,
                         generatingSince = if (detail.generating) it.generatingSince else null,
                         pendingApproval = detail.pendingApproval,
+                        pendingForm = detail.pendingForm,
                     )
                 }
                 if (!detail.generating) {
@@ -436,9 +443,15 @@ class AppController(private val app: Application) {
                     "thinking" -> updateReply { it.copy(thinking = it.thinking + ev.optString("text")) }
                     "tool_call" -> {
                         val call = ToolCall(ev.optString("call_id"), ev.optString("name"), ev.argumentsText("arguments"))
-                        updateReply { it.copy(toolCalls = it.toolCalls + call) }
+                        // OpenCode announces a call again when it starts waiting for approval.
+                        if (s.messages.none { m -> m.toolCalls.any { it.id == call.id } }) {
+                            updateReply { it.copy(toolCalls = it.toolCalls + call) }
+                        }
                         if (ev.optBoolean("needs_approval")) {
-                            _state.update { it.copy(pendingApproval = PendingApproval(sessionId, call.id, call.name, call.arguments)) }
+                            val save = ev.optJSONArray("save")?.strings().orEmpty()
+                            _state.update {
+                                it.copy(pendingApproval = PendingApproval(sessionId, call.id, call.name, call.arguments, save))
+                            }
                         }
                     }
                     "tool_output" -> _state.update { st ->
@@ -456,6 +469,15 @@ class AppController(private val app: Application) {
                             liveOutput = st.liveOutput - id,
                             pendingApproval = st.pendingApproval?.takeIf { it.callId != id },
                         )
+                    }
+                    "approval_resolved" -> _state.update { st ->
+                        st.copy(pendingApproval = st.pendingApproval?.takeIf { it.callId != ev.optString("call_id") })
+                    }
+                    "form" -> ev.optJSONObject("form")?.let { form ->
+                        _state.update { it.copy(pendingForm = PendingForm.from(form)) }
+                    }
+                    "form_resolved" -> _state.update { st ->
+                        st.copy(pendingForm = st.pendingForm?.takeIf { it.id != ev.optString("form_id") })
                     }
                     "turn" -> _state.update { it.copy(messages = it.messages + ChatMessage("assistant", "", partial = true)) }
                     "end" -> {
@@ -476,7 +498,9 @@ class AppController(private val app: Application) {
             throw e
         } finally {
             chatId = null
-            _state.update { it.copy(generatingSince = null, pendingApproval = null, liveOutput = emptyMap()) }
+            _state.update {
+                it.copy(generatingSince = null, pendingApproval = null, pendingForm = null, liveOutput = emptyMap())
+            }
         }
         refreshSessions()
         // The server's copy is canonical (full tool outputs, final statuses, title).
@@ -496,6 +520,29 @@ class AppController(private val app: Application) {
     fun stop() {
         val id = s.session?.id ?: return
         withClient { it.call("cancel", mapOf("session" to id)) }
+    }
+
+    /** Sends the answers to the agent's question ([answer] maps field keys to values). */
+    fun replyForm(form: PendingForm, answer: Map<String, Any?>) = answerForm(form) { c ->
+        c.call("form_reply", mapOf("session" to form.session, "form_id" to form.id, "answer" to answer))
+    }
+
+    /** Dismisses the agent's question without answering. */
+    fun cancelForm(form: PendingForm) = answerForm(form) { c ->
+        c.call("form_cancel", mapOf("session" to form.session, "form_id" to form.id))
+    }
+
+    private fun answerForm(form: PendingForm, send: suspend (RelayClient) -> Unit) {
+        _state.update { it.copy(pendingForm = it.pendingForm?.takeIf { p -> p.id != form.id }) }
+        withClient { c ->
+            try {
+                send(c)
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                _state.update { it.copy(pendingForm = form) } // still waiting: show it again
+                throw e
+            }
+        }
     }
 
     /** decision: allow, allow_session or deny. [note] is passed to the model with a denial. */

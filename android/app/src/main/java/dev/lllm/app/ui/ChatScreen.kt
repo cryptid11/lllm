@@ -45,6 +45,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -60,8 +61,12 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.lllm.app.relay.ChatMessage
+import dev.lllm.app.relay.FormField
 import dev.lllm.app.relay.PendingApproval
+import dev.lllm.app.relay.PendingForm
+import dev.lllm.app.relay.strings
 import dev.lllm.app.relay.ToolCall
+import org.json.JSONArray
 import org.json.JSONObject
 import kotlinx.coroutines.delay
 
@@ -108,7 +113,10 @@ fun ChatScreen(state: UiState, vm: AppController) {
         },
         bottomBar = {
             val pending = state.pendingApproval
-            if (pending != null) {
+            val form = state.pendingForm
+            if (form != null) {
+                FormCard(form, onSubmit = { vm.replyForm(form, it) }, onSkip = { vm.cancelForm(form) })
+            } else if (pending != null) {
                 ApprovalCard(
                     pending,
                     onAllow = { vm.approve("allow") },
@@ -206,7 +214,11 @@ private fun Welcome(state: UiState) {
         Text("  ${session.provider} · ${session.model}", color = Palette.Dim, fontSize = 12.sp)
         Text("  ${state.profile?.label}", color = Palette.Dim, fontSize = 12.sp)
         if (session.agent) {
-            val engine = if (session.engine == "pi") "pi agent" else "agent"
+            val engine = when (session.engine) {
+                "opencode" -> "opencode"
+                "pi" -> "pi agent"
+                else -> "agent"
+            }
             Text("  $engine · ${session.permissionMode} · ${session.cwd}", color = Palette.Dim, fontSize = 12.sp)
         } else {
             Text("  chat only (/agent to give it tools)", color = Palette.Dim, fontSize = 12.sp)
@@ -321,11 +333,11 @@ private fun ApprovalCard(
     val args = remember(pending.arguments) { runCatching { JSONObject(pending.arguments) }.getOrDefault(JSONObject()) }
     fun diff(old: String, new: String) = "- " + old.replace("\n", "\n- ") + "\n+ " + new.replace("\n", "\n+ ")
     val detail = when (pending.name) {
-        "bash" -> args.optString("command")
+        "bash", "shell" -> args.optString("command")
         "write_file", "write" -> args.optString("content").let { if (it.length > 1500) it.take(1500) + "\n…" else it }
         "edit_file" -> diff(args.optString("old_string"), args.optString("new_string"))
-        // Pi's edit: a list of {oldText, newText} replacements.
-        "edit" -> args.optJSONArray("edits")?.let { edits ->
+        // OpenCode's edit has one replacement, Pi's a list of {oldText, newText}.
+        "edit" -> if (args.has("oldString")) diff(args.optString("oldString"), args.optString("newString")) else args.optJSONArray("edits")?.let { edits ->
             (0 until edits.length()).mapNotNull { edits.optJSONObject(it) }
                 .joinToString("\n⋯\n") { diff(it.optString("oldText"), it.optString("newText")) }
         } ?: args.toString(2)
@@ -377,7 +389,132 @@ private fun ApprovalCard(
                 Text("Deny", color = Palette.Error, fontSize = 13.sp)
             }
         }
-        Text("Always = allow ${pending.name} for the rest of this session", color = Palette.Dim, fontSize = 11.sp)
+        Text(
+            if (pending.save.isEmpty()) "Always = allow ${pending.name} for the rest of this session"
+            else "Always = OpenCode remembers this for the whole project: ${pending.name} ${pending.save.joinToString(", ")}",
+            color = Palette.Dim, fontSize = 11.sp,
+        )
+    }
+}
+
+/** A question from the agent, which waits until it is answered or skipped. */
+@Composable
+private fun FormCard(form: PendingForm, onSubmit: (Map<String, Any?>) -> Unit, onSkip: () -> Unit) {
+    val answers = remember(form.id) {
+        mutableStateMapOf<String, Any?>().apply {
+            form.fields.forEach { f ->
+                val default = f.default
+                when {
+                    default is JSONArray -> put(f.key, default.strings().toSet())
+                    default != null -> put(f.key, default)
+                }
+            }
+        }
+    }
+    fun visible(f: FormField) = f.type != "external" && f.conditions.all { (key, op, value) ->
+        val same = answers[key]?.toString() == value?.toString()
+        if (op == "neq") !same else same
+    }
+    fun valueOf(f: FormField): Any? = when (f.type) {
+        "integer" -> (answers[f.key] as? String)?.trim()?.toLongOrNull() ?: (answers[f.key] as? Number)
+        "number" -> (answers[f.key] as? String)?.trim()?.toDoubleOrNull() ?: (answers[f.key] as? Number)
+        "multiselect" -> (answers[f.key] as? Set<*>)?.takeIf { it.isNotEmpty() }?.toList()
+        "boolean" -> answers[f.key] as? Boolean
+        else -> (answers[f.key] as? String)?.takeIf { it.isNotBlank() }
+    }
+    val fields = form.fields.filter(::visible)
+    val complete = fields.all { f ->
+        val needed = f.required || (form.isQuestion && f.options.isNotEmpty())
+        val typed = answers[f.key] as? String
+        valueOf(f) != null || (!needed && typed.isNullOrBlank())
+    }
+    Column(
+        Modifier
+            .background(Palette.Bg)
+            .navigationBarsPadding()
+            .imePadding()
+            .padding(horizontal = 10.dp, vertical = 6.dp)
+            .border(1.dp, Palette.Accent, RoundedCornerShape(8.dp))
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(form.title.ifEmpty { "Question" }, color = Palette.Accent, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+        Column(
+            Modifier.heightIn(max = 340.dp).verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            form.fields.filter { it.type == "external" }.forEach { f ->
+                SelectionContainer { Text("${f.title.ifEmpty { f.key }}: ${f.url}", color = Palette.Code, fontSize = 12.sp) }
+            }
+            fields.forEach { f -> FormFieldView(f, answers) }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = { onSubmit(fields.mapNotNull { f -> valueOf(f)?.let { f.key to it } }.toMap()) },
+                enabled = complete,
+            ) { Text("Send") }
+            OutlinedButton(onClick = onSkip) { Text("Skip", fontSize = 13.sp) }
+        }
+    }
+}
+
+@Composable
+private fun FormFieldView(f: FormField, answers: MutableMap<String, Any?>) {
+    @Composable
+    fun choice(label: String, description: String, selected: Boolean, onClick: () -> Unit) {
+        Row(Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 5.dp)) {
+            Text(if (selected) "● " else "○ ", color = if (selected) Palette.Accent else Palette.Dim, fontSize = 13.sp)
+            Column {
+                Text(label, color = Palette.Text, fontSize = 13.sp)
+                if (description.isNotBlank()) Text(description, color = Palette.Dim, fontSize = 11.sp)
+            }
+        }
+    }
+
+    @Composable
+    fun textInput(value: String, hint: String, onChange: (String) -> Unit) {
+        BasicTextField(
+            value = value,
+            onValueChange = onChange,
+            modifier = Modifier
+                .fillMaxWidth()
+                .border(1.dp, Palette.Border, RoundedCornerShape(6.dp))
+                .padding(8.dp),
+            textStyle = TextStyle(color = Palette.Text, fontSize = 13.sp, fontFamily = FontFamily.Monospace),
+            cursorBrush = SolidColor(Palette.Accent),
+            decorationBox = { field ->
+                if (value.isEmpty() && hint.isNotEmpty()) Text(hint, color = Palette.Dim, fontSize = 13.sp)
+                field()
+            },
+        )
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        if (f.title.isNotBlank()) Text(f.title, color = Palette.Text, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+        if (f.description.isNotBlank()) Text(f.description, color = Palette.Dim, fontSize = 12.sp)
+        when {
+            f.type == "boolean" -> listOf(true to "Yes", false to "No").forEach { (value, label) ->
+                choice(label, "", answers[f.key] == value) { answers[f.key] = value }
+            }
+            f.type == "multiselect" -> {
+                @Suppress("UNCHECKED_CAST")
+                val chosen = answers[f.key] as? Set<String> ?: emptySet()
+                f.options.forEach { o ->
+                    choice(o.label, o.description, o.value in chosen) {
+                        answers[f.key] = if (o.value in chosen) chosen - o.value else chosen + o.value
+                    }
+                }
+            }
+            f.options.isNotEmpty() -> {
+                val current = answers[f.key] as? String
+                f.options.forEach { o -> choice(o.label, o.description, current == o.value) { answers[f.key] = o.value } }
+                if (f.custom) {
+                    val typed = current?.takeIf { value -> f.options.none { it.value == value } }.orEmpty()
+                    textInput(typed, "or type your own answer…") { answers[f.key] = it }
+                }
+            }
+            else -> textInput(answers[f.key]?.toString().orEmpty(), f.placeholder) { answers[f.key] = it }
+        }
     }
 }
 
