@@ -2,6 +2,7 @@ package dev.lllm.app.ui
 
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -125,6 +126,7 @@ fun SessionsScreen(state: UiState, vm: AppController) {
         },
     ) { pad ->
         Column(Modifier.padding(pad).fillMaxSize()) {
+            if (state.engineTab != null) EngineTabs(state, vm)
             val conn = state.conn
             if (conn is Conn.Down) {
                 Column(
@@ -196,6 +198,39 @@ fun SessionsScreen(state: UiState, vm: AppController) {
             },
             dismissButton = { TextButton(onClick = { renaming = null }) { Text("Cancel") } },
         )
+    }
+}
+
+/** Chooses which system the list shows and where "New session" creates one. */
+@Composable
+private fun EngineTabs(state: UiState, vm: AppController) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 6.dp)
+            .background(Palette.Surface, RoundedCornerShape(8.dp))
+            .padding(3.dp)
+    ) {
+        state.engines.forEach { engine ->
+            val selected = engine == state.engineTab
+            Box(
+                Modifier
+                    .weight(1f)
+                    .background(if (selected) Palette.Accent else Color.Transparent, RoundedCornerShape(6.dp))
+                    .clickable { vm.selectEngine(engine) }
+                    .padding(vertical = 8.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    when (engine) {
+                        "opencode" -> "OpenCode"
+                        "pi" -> "Pi"
+                        else -> "Built-in"
+                    },
+                    color = if (selected) Palette.Bg else Palette.Dim, fontSize = 14.sp,
+                )
+            }
+        }
     }
 }
 

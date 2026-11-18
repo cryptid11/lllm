@@ -83,6 +83,17 @@ class CoreTest {
     }
 
     @Test
+    fun engineTabFiltersSessions() {
+        fun s(id: String, engine: String, archived: Boolean = false) =
+            SessionSummary(id, id, 0.0, "p", "m", 0, "", false, archived, engine)
+        val all = listOf(s("oc", "opencode"), s("pi", "pi"), s("old", "builtin"), s("gone", "opencode", archived = true))
+        assertEquals(listOf("oc"), UiState(sessions = all, engineTab = "opencode").visibleSessions.map { it.id })
+        assertEquals(1, UiState(sessions = all, engineTab = "opencode").archivedCount)
+        assertEquals(listOf("pi", "old"), UiState(sessions = all, engineTab = "pi").visibleSessions.map { it.id })
+        assertEquals(0, UiState(sessions = all, engineTab = "pi").archivedCount)
+    }
+
+    @Test
     fun parsesOpenCodeApprovalAndQuestion() {
         val data = JSONObject(
             """{"session": {"id": "ses_1", "title": "t", "provider": "opencode", "model": "opencode/m",

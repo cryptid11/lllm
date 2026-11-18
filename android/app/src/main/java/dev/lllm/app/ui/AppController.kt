@@ -5,6 +5,7 @@ import dev.lllm.app.RelayService
 import dev.lllm.app.data.Profile
 import dev.lllm.app.data.ProfileStore
 import dev.lllm.app.relay.ChatMessage
+import dev.lllm.app.relay.FolderListing
 import dev.lllm.app.relay.Hello
 import dev.lllm.app.relay.PendingApproval
 import dev.lllm.app.relay.PendingForm
@@ -62,11 +63,16 @@ data class UiState(
     val liveOutput: Map<String, String> = emptyMap(),
     /** The app is on screen (otherwise approvals also raise a notification). */
     val appVisible: Boolean = true,
+    /** Engines the server offers for new sessions. */
+    val engines: List<String> = emptyList(),
+    /** The engine chosen at the top of the session list; null when there is no choice. */
+    val engineTab: String? = null,
 ) {
     val connected get() = conn is Conn.Up
     val generating get() = generatingSince != null
-    val visibleSessions get() = sessions.filter { it.archived == showArchived && it.id !in pendingDelete }
-    val archivedCount get() = sessions.count { it.archived && it.id !in pendingDelete }
+    private fun inTab(s: SessionSummary) = engineTab == null || (s.engine == "opencode") == (engineTab == "opencode")
+    val visibleSessions get() = sessions.filter { it.archived == showArchived && it.id !in pendingDelete && inTab(it) }
+    val archivedCount get() = sessions.count { it.archived && it.id !in pendingDelete && inTab(it) }
 }
 
 /**
@@ -78,6 +84,7 @@ class AppController(private val app: Application) {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val store = ProfileStore(app)
+    private val uiPrefs = app.getSharedPreferences("ui", android.content.Context.MODE_PRIVATE)
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state.asStateFlow()
 
@@ -176,7 +183,14 @@ class AppController(private val app: Application) {
                 notice("Trusted host key $fp")
             }
             client = c
-            _state.update { it.copy(conn = Conn.Up(hello)) }
+            val saved = uiPrefs.getString("engineTab", null)
+            val tab = when {
+                hello.engines.size < 2 -> null
+                saved in hello.engines -> saved
+                hello.engine in hello.engines -> hello.engine
+                else -> hello.engines.first()
+            }
+            _state.update { it.copy(conn = Conn.Up(hello), engines = hello.engines, engineTab = tab) }
             launch {
                 val reason = c.closed.await()
                 if (client === c) {
@@ -240,6 +254,18 @@ class AppController(private val app: Application) {
         data.str("warning")?.let(::notice)
     }
 
+    fun selectEngine(engine: String) {
+        uiPrefs.edit().putString("engineTab", engine).apply()
+        _state.update { it.copy(engineTab = engine) }
+    }
+
+    suspend fun listFolders(path: String?): FolderListing {
+        val c = client ?: throw RelayException("Not connected")
+        return FolderListing.from(c.call("list_dirs", mapOf("path" to path)))
+    }
+
+    fun setFolder(path: String) = updateSession(mapOf("cwd" to path)) { "Folder: ${it.cwd}" }
+
     fun setVisible(visible: Boolean) = _state.update { it.copy(appVisible = visible) }
 
     fun openSession(id: String) {
@@ -251,7 +277,7 @@ class AppController(private val app: Application) {
     }
 
     fun newSession() = withClient { c ->
-        val detail = SessionDetail.from(c.call("new_session"))
+        val detail = SessionDetail.from(c.call("new_session", s.engineTab?.let { mapOf("engine" to it) } ?: emptyMap()))
         _state.update {
             it.copy(screen = Screen.Chat, session = detail, messages = emptyList(), generatingSince = null)
         }

@@ -80,8 +80,12 @@ and sessions started on the phone show up in OpenCode, with its models, tools an
 
 ```json
 "engine": "opencode",
+"local_engine": "pi",
 "opencode": {"workdir": "~", "permission_mode": "auto-read"}
 ```
+
+The session list then has a switch at the top between OpenCode and `local_engine`: each side shows
+its own sessions, and **New session** creates one there.
 
 The relay finds the service with `opencode service status` (starting it if needed) and reads its
 password from `~/.config/opencode/service.json`, so the password stays on the server and no port
@@ -93,7 +97,8 @@ is opened: the phone still only uses SSH. `lllm-relay doctor` checks the connect
 - **Always** on an approval saves OpenCode's rule for the whole project; the card shows which one.
 - Questions from the agent appear as a card, or a notification when the app is in the background.
 - If the phone disconnects, OpenCode carries on; the app catches up when it reconnects.
-- Older Pi and built-in sessions stay in the list and keep their engine.
+- Older Pi and built-in sessions keep their engine and appear on the `local_engine` side.
+- Tap the folder under the prompt to browse to or type another working folder.
 
 ### Agent engine: Pi
 

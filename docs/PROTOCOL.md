@@ -20,13 +20,14 @@ message that belongs to that request. Requests may be pipelined; replies can arr
 | `info`           |                                                           | same as `hello` (below)          |
 | `list_models`    | `provider?`                                               | `{provider, models: [str]}`      |
 | `list_sessions`  |                                                           | `{sessions: [Summary]}`          |
-| `new_session`    | `title?`, `provider?`, `model?`, `system?`, `options?`    | `{session: Session}`             |
+| `new_session`    | `title?`, `provider?`, `model?`, `system?`, `options?`, `engine?` (one of hello's `engines`) | `{session: Session}`             |
 | `get_session`    | `session`                                                 | `{session: Session}`             |
 | `update_session` | `session`, any of `title`, `provider`, `model`, `system`, `options`, `archived` | `{session: Session}` |
 | `delete_session` | `session`                                                 | `{deleted: id}`                  |
 | `chat`           | `session`, `text`                                         | streamed events (below)          |
 | `cancel`         | `target` (a `chat` request id on this connection) or `session` (works from any connection) | `{cancelled: bool}` |
 | `approve`        | `session`, `call_id`, `decision` (`allow`, `allow_session`, `deny`), `note?` | `{ok}`        |
+| `list_dirs`      | `path?` (default: home)                                   | `{path, parent, dirs: [str]}`    |
 | `form_reply`     | `session`, `form_id`, `answer` (object of field key → value); OpenCode only | `{ok}`         |
 | `form_cancel`    | `session`, `form_id`; OpenCode only                       | `{ok}`                           |
 

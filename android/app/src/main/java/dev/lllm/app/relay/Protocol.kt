@@ -12,6 +12,9 @@ data class Hello(
     val protocol: Int,
     val host: String,
     val defaultProvider: String,
+    val engine: String = "builtin",
+    /** Engines new sessions can use; several means the app offers a choice. */
+    val engines: List<String> = emptyList(),
 ) {
     companion object {
         fun from(o: JSONObject) = Hello(
@@ -19,6 +22,19 @@ data class Hello(
             protocol = o.optInt("protocol"),
             host = o.optString("host"),
             defaultProvider = o.optString("default_provider"),
+            engine = o.optString("engine", "builtin"),
+            engines = o.optJSONArray("engines")?.strings().orEmpty(),
+        )
+    }
+}
+
+/** A folder on the server and its subfolders. */
+data class FolderListing(val path: String, val parent: String?, val dirs: List<String>) {
+    companion object {
+        fun from(o: JSONObject) = FolderListing(
+            path = o.optString("path"),
+            parent = o.str("parent"),
+            dirs = o.optJSONArray("dirs")?.strings().orEmpty(),
         )
     }
 }
@@ -33,6 +49,7 @@ data class SessionSummary(
     val preview: String,
     val generating: Boolean,
     val archived: Boolean = false,
+    val engine: String = "builtin",
 ) {
     companion object {
         fun from(o: JSONObject) = SessionSummary(
@@ -45,6 +62,7 @@ data class SessionSummary(
             preview = o.str("preview") ?: "",
             generating = o.optBoolean("generating"),
             archived = o.optBoolean("archived"),
+            engine = o.str("engine") ?: "builtin",
         )
 
         fun listFrom(data: JSONObject): List<SessionSummary> =

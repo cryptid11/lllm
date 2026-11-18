@@ -109,6 +109,21 @@ class OpenCodeEngineTest(unittest.TestCase):
         self.assertIn(local["id"], listed)
         self.assertEqual(self.client.call("list_models")["data"]["models"], ["opencode/default-model", "x/chat-2"])
 
+    def test_engine_choice_and_folder_listing(self):
+        self.assertEqual(self.client.hello["engines"], ["opencode", "builtin"])
+        chosen = self.client.call("new_session", engine="builtin")["data"]["session"]
+        self.assertEqual(chosen["engine"], "builtin")
+        self.assertFalse(chosen["id"].startswith("ses"))
+        self.assertEqual(self.client.call("new_session", engine="opencode")["data"]["session"]["engine"], "opencode")
+        self.assertIn("engine must be", self.client.call("new_session", engine="nope")["error"])
+        (self.root / "work" / "b").mkdir()
+        (self.root / "work" / "A").mkdir()
+        (self.root / "work" / ".hidden").mkdir()
+        (self.root / "work" / "file.txt").write_text("x")
+        data = self.client.call("list_dirs", path=str(self.root / "work"))["data"]
+        self.assertEqual(data, {"path": str(self.root / "work"), "parent": str(self.root), "dirs": ["A", "b"]})
+        self.assertIn("cannot open", self.client.call("list_dirs", path=str(self.root / "nope"))["error"])
+
     def test_chat_streams_and_session_is_read_back(self):
         s = self.session()
         events = self.client.events_until_end(self.client.send("chat", session=s["id"], text="hello there"))

@@ -24,6 +24,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -32,6 +34,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -57,10 +60,12 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.lllm.app.relay.ChatMessage
+import dev.lllm.app.relay.FolderListing
 import dev.lllm.app.relay.FormField
 import dev.lllm.app.relay.PendingApproval
 import dev.lllm.app.relay.PendingForm
@@ -68,6 +73,7 @@ import dev.lllm.app.relay.strings
 import dev.lllm.app.relay.ToolCall
 import org.json.JSONArray
 import org.json.JSONObject
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -75,6 +81,7 @@ import kotlinx.coroutines.delay
 fun ChatScreen(state: UiState, vm: AppController) {
     val session = state.session
     var input by rememberSaveable { mutableStateOf("") }
+    var pickingFolder by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
     var follow by remember { mutableStateOf(true) }
 
@@ -141,6 +148,7 @@ fun ChatScreen(state: UiState, vm: AppController) {
                 onStop = { vm.stop() },
                 onModel = { vm.loadModels() },
                 onMode = { vm.cycleMode() },
+                onFolder = { pickingFolder = true },
             )
         },
     ) { pad ->
@@ -180,7 +188,7 @@ fun ChatScreen(state: UiState, vm: AppController) {
             onDismissRequest = { vm.closeModels() },
             title = { Text("Model") },
             text = {
-                Column {
+                Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState())) {
                     if (models.isEmpty()) Text("No models on the backend", color = Palette.Dim)
                     models.forEach { m ->
                         val current = m == session?.model
@@ -198,6 +206,79 @@ fun ChatScreen(state: UiState, vm: AppController) {
             confirmButton = { TextButton(onClick = { vm.closeModels() }) { Text("Close") } },
         )
     }
+
+    if (pickingFolder && session != null) {
+        FolderDialog(session.cwd, vm, onDismiss = { pickingFolder = false })
+    }
+}
+
+/** Browse the server's folders or type a path, then use it as the session's working folder. */
+@Composable
+private fun FolderDialog(start: String, vm: AppController, onDismiss: () -> Unit) {
+    var path by remember { mutableStateOf(start) }
+    var opened by remember { mutableStateOf(start) }
+    var listing by remember { mutableStateOf<FolderListing?>(null) }
+    var error by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(opened) {
+        listing = null
+        error = null
+        try {
+            val found = vm.listFolders(opened)
+            listing = found
+            path = found.path
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            error = e.message ?: "Cannot open that folder"
+        }
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Working folder") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    path, { path = it }, Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    textStyle = TextStyle(fontSize = 13.sp, fontFamily = FontFamily.Monospace),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
+                    keyboardActions = KeyboardActions(onGo = { opened = path.trim() }),
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { listing?.parent?.let { opened = it } }, enabled = listing?.parent != null) {
+                        Text("↑ Up", fontSize = 13.sp)
+                    }
+                    OutlinedButton(onClick = { opened = path.trim() }) { Text("Open", fontSize = 13.sp) }
+                }
+                error?.let { Text(it, color = Palette.Error, fontSize = 12.sp) }
+                val current = listing
+                Column(Modifier.heightIn(max = 280.dp).verticalScroll(rememberScrollState())) {
+                    when {
+                        current == null && error == null -> Text("Loading…", color = Palette.Dim, fontSize = 13.sp)
+                        current?.dirs?.isEmpty() == true -> Text("No subfolders", color = Palette.Dim, fontSize = 13.sp)
+                    }
+                    current?.let { folder ->
+                        folder.dirs.forEach { name ->
+                            Text(
+                                "$name/",
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clickable { opened = folder.path.trimEnd('/') + "/" + name }
+                                    .padding(vertical = 9.dp),
+                                color = Palette.Text, fontSize = 14.sp,
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { vm.setFolder(path.trim()); onDismiss() }, enabled = path.isNotBlank()) {
+                Text("Use this folder")
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 @Composable
@@ -570,6 +651,7 @@ private fun PromptBar(
     onStop: () -> Unit,
     onModel: () -> Unit,
     onMode: () -> Unit,
+    onFolder: () -> Unit,
 ) {
     Column(
         Modifier
@@ -649,6 +731,20 @@ private fun PromptBar(
             }
             Spacer(Modifier.weight(1f))
             Text("/ for commands", color = Palette.Dim, fontSize = 11.sp)
+        }
+        val session = state.session
+        if (session?.agent == true && session.cwd.isNotEmpty()) {
+            // A Pi session cannot leave the folder its conversation started in.
+            val locked = session.engine == "pi" && state.messages.isNotEmpty()
+            val shown = if (session.cwd.length > 44) "…" + session.cwd.takeLast(43) else session.cwd
+            Text(
+                if (locked) "folder  $shown" else "folder  $shown  ✎",
+                Modifier
+                    .fillMaxWidth()
+                    .clickable(enabled = state.connected && !state.generating && !locked) { onFolder() }
+                    .padding(start = 4.dp, top = 5.dp, bottom = 2.dp),
+                color = if (locked) Palette.Dim else Palette.Accent, fontSize = 11.sp, maxLines = 1,
+            )
         }
     }
 }

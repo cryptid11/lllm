@@ -58,6 +58,8 @@ DEFAULT_CONFIG = {
     # Agent engine for new sessions: "builtin" (this file's tool loop), "pi" (https://pi.dev)
     # or "opencode" (the OpenCode service on this machine; its sessions appear in the app).
     "engine": "builtin",
+    # With "engine": "opencode": the engine of the app's other tab ("builtin" or "pi").
+    "local_engine": "builtin",
     "opencode": {
         "command": "opencode",
         # Empty: ask `opencode service status`, starting the service if needed.
@@ -1510,6 +1512,17 @@ class Engine:
             self._opencode = OpenCode(self.cfg.get("opencode"))
         return self._opencode
 
+    @property
+    def local_engine(self):
+        return self.cfg.get("local_engine") or "builtin"
+
+    @property
+    def engines(self):
+        """Engines new sessions can use; the app offers a choice when there are several."""
+        if self.uses_opencode:
+            return ["opencode", self.local_engine]
+        return [self.cfg.get("engine") or "builtin"]
+
     def list_sessions(self):
         """Saved sessions of every engine, newest activity first."""
         result = {"sessions": self.store.list()}
@@ -1557,6 +1570,7 @@ class Engine:
             "host": socket.gethostname(),
             "default_provider": self.provider().name,
             "engine": self.cfg.get("engine") or "builtin",
+            "engines": self.engines,
             "providers": {n: {"type": p.cfg["type"], "default_model": p.cfg.get("default_model") or None}
                           for n, p in self.providers.items()},
         }
@@ -1575,8 +1589,11 @@ class Engine:
     def pi_cfg(self):
         return {**DEFAULT_CONFIG["pi"], **(self.cfg.get("pi") or {})}
 
-    def new_session(self, title=None, provider=None, model=None, system=None, options=None, agent=None):
-        if self.uses_opencode and provider in (None, "opencode"):
+    def new_session(self, title=None, provider=None, model=None, system=None, options=None, agent=None,
+                    engine=None):
+        if engine is not None and engine not in self.engines:
+            raise RelayError(f"engine must be one of {', '.join(self.engines)}")
+        if self.uses_opencode and provider in (None, "opencode") and engine in (None, "opencode"):
             return self.opencode.new_session(title, model)
         p = self.provider(provider)
         now = time.time()
@@ -1592,7 +1609,7 @@ class Engine:
             "agent": bool(self.agent_cfg.get("enabled")) if agent is None else bool(agent),
             "permission_mode": self.agent_cfg.get("permission_mode", "auto-read"),
             "cwd": self._default_cwd(),
-            "engine": "builtin" if self.uses_opencode else (self.cfg.get("engine") or "builtin"),
+            "engine": self.local_engine if self.uses_opencode else (self.cfg.get("engine") or "builtin"),
             "messages": [],
         }
         with self.store.lock:
@@ -2296,8 +2313,22 @@ class Server:
 
     def op_new_session(self, rid, req):
         s = self.engine.new_session(req.get("title"), req.get("provider"), req.get("model"),
-                                    req.get("system"), req.get("options"), req.get("agent"))
+                                    req.get("system"), req.get("options"), req.get("agent"), req.get("engine"))
         return {"session": s}
+
+    def op_list_dirs(self, rid, req):
+        """Subfolders of `path` (default: home), for choosing a working folder."""
+        path = req.get("path") or "~"
+        if not isinstance(path, str):
+            raise RelayError("path must be a string")
+        path = os.path.abspath(os.path.expanduser(path))
+        try:
+            with os.scandir(path) as entries:
+                dirs = sorted((e.name for e in entries if e.is_dir() and not e.name.startswith(".")), key=str.lower)
+        except OSError as e:
+            raise RelayError(f"cannot open {path}: {e.strerror}") from None
+        parent = os.path.dirname(path)
+        return {"path": path, "parent": parent if parent != path else None, "dirs": dirs[:500]}
 
     def op_get_session(self, rid, req):
         return {"session": self.engine.get_session(req.get("session"))}
