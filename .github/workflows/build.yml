@@ -54,3 +54,12 @@ jobs:
           target_commitish: ${{ github.sha }}
           files: android/lllm-*.apk
           generate_release_notes: true
+      # Wakes the user's Obtainium fork to install the new release right away (no-op without the secret).
+      - name: Tell Obtainium about the release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        env:
+          OBTAINIUM_PUSH_URL: ${{ secrets.OBTAINIUM_PUSH_URL }}
+        run: |
+          [ -n "$OBTAINIUM_PUSH_URL" ] || exit 0
+          curl -fsS -d "https://github.com/${{ github.repository }}" "$OBTAINIUM_PUSH_URL"
