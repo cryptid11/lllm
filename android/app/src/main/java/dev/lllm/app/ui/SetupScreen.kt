@@ -46,6 +46,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.lllm.app.data.Profile
@@ -218,6 +219,15 @@ fun SetupScreen(state: UiState, vm: AppController) {
                 },
                 Modifier.fillMaxWidth(),
             ) { Text("Save & connect") }
+            val appVersion = remember {
+                runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }.getOrNull()
+            }
+            val relayVersion = (state.conn as? Conn.Up)?.hello?.version
+            Text(
+                listOfNotNull("lllm ${appVersion ?: "?"}", relayVersion?.let { "relay $it" }).joinToString(" · "),
+                Modifier.fillMaxWidth().padding(top = 16.dp),
+                color = Palette.Dim, fontSize = 11.sp, textAlign = TextAlign.Center,
+            )
             Spacer(Modifier.height(24.dp))
         }
     }
